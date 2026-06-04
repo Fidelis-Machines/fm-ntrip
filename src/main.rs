@@ -722,3 +722,53 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `Cli` from argv-style flags, as clap would at runtime.
+    fn cli(args: &[&str]) -> Cli {
+        let mut argv = vec!["fm-ntrip"];
+        argv.extend_from_slice(args);
+        Cli::parse_from(argv)
+    }
+
+    #[test]
+    fn sourcetable_advertises_configured_fields() {
+        let st = build_sourcetable(&cli(&[
+            "-m",
+            "MYBASE",
+            "--identifier",
+            "STATION-X",
+            "--country",
+            "DEU",
+            "--lat",
+            "52.5",
+            "--lon",
+            "13.4",
+        ]));
+
+        // One STR record for the configured mountpoint, terminated per spec.
+        assert!(
+            st.starts_with("STR;MYBASE;STATION-X;RTCM 3.3;"),
+            "STR line should lead with mountpoint + identifier; got: {st:?}"
+        );
+        assert!(st.contains(";DEU;"), "country code should appear: {st:?}");
+        assert!(st.contains(";52.5000;"), "lat formatted to 4 dp: {st:?}");
+        assert!(st.contains(";13.4000;"), "lon formatted to 4 dp: {st:?}");
+        assert!(
+            st.ends_with("ENDSOURCETABLE\r\n"),
+            "table must be CRLF-terminated with ENDSOURCETABLE: {st:?}"
+        );
+        // Exactly one record advertised.
+        assert_eq!(st.matches("STR;").count(), 1, "single mountpoint expected");
+    }
+
+    #[test]
+    fn sourcetable_uses_defaults_when_unset() {
+        let st = build_sourcetable(&cli(&[]));
+        assert!(st.starts_with("STR;RTCM3;FM-NTRIP;"), "defaults: {st:?}");
+        assert!(st.contains(";USA;"), "default country: {st:?}");
+    }
+}

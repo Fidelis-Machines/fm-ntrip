@@ -23,6 +23,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 base64 = "0.22"
 
+[dev-dependencies]
+base64 = "0.22"
+# PTY support for the fan-out integration test: a pseudo-terminal stands in for
+# the USB serial device so the caster can be driven end-to-end without hardware.
+nix = { version = "0.30", features = ["term"] }
+
 [profile.release]
 lto = "thin"
 strip = true
