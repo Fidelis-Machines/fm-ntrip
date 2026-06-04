@@ -122,13 +122,17 @@ struct Cli {
     #[arg(long, default_value = "FM-NTRIP")]
     identifier: String,
 
-    /// Latitude reported in the source table (decimal degrees).
-    #[arg(long, default_value_t = 0.0)]
-    lat: f64,
+    /// Latitude advertised in the source table (decimal degrees). Optional: when
+    /// unset, the base position decoded from the RTCM stream (1005/1006) is used.
+    /// Acts as a fallback until that position is known.
+    #[arg(long)]
+    lat: Option<f64>,
 
-    /// Longitude reported in the source table (decimal degrees).
-    #[arg(long, default_value_t = 0.0)]
-    lon: f64,
+    /// Longitude advertised in the source table (decimal degrees). Optional: when
+    /// unset, the base position decoded from the RTCM stream (1005/1006) is used.
+    /// Acts as a fallback until that position is known.
+    #[arg(long)]
+    lon: Option<f64>,
 
     /// ISO 3-letter country code reported in the source table.
     #[arg(long, default_value = "USA")]
@@ -391,7 +395,16 @@ async fn run_self_test(device: &str, baud: u32, dur: Duration) -> Result<()> {
 // NTRIP source table per BKG NTRIP v1.0 spec.
 // Single STR record advertising the configured mountpoint.
 // =============================================================================
-fn build_sourcetable(cli: &Cli) -> String {
+//
+// The advertised latitude/longitude come from the base position decoded from the
+// live RTCM stream (1005/1006) when available, so the table self-configures from
+// the hardware. The `--lat`/`--lon` flags are a fallback used until that position
+// is known (or if the base never broadcasts one).
+fn build_sourcetable(cli: &Cli, pos: Option<(f64, f64, f64)>) -> String {
+    let (lat, lon) = match pos {
+        Some((lat, lon, _height)) => (lat, lon),
+        None => (cli.lat.unwrap_or(0.0), cli.lon.unwrap_or(0.0)),
+    };
     // Field order:
     //   STR;mountpoint;identifier;format;format-details;carrier;nav-system;
     //       network;country;lat;lon;nmea;solution;generator;compr-encryp;
@@ -401,8 +414,6 @@ fn build_sourcetable(cli: &Cli) -> String {
         m = cli.mountpoint,
         id = cli.identifier,
         cc = cli.country,
-        lat = cli.lat,
-        lon = cli.lon,
     );
     format!("{str_line}ENDSOURCETABLE\r\n")
 }
@@ -484,7 +495,10 @@ async fn handle_client(
 
     // Root → source table.
     if path.is_empty() {
-        let body = build_sourcetable(&cli);
+        // Advertise the base position decoded from the live stream when we have
+        // it; otherwise fall back to the --lat/--lon flags inside build_sourcetable.
+        let pos = stats.gnss.lock().unwrap().pos;
+        let body = build_sourcetable(&cli, pos);
         // v2 returns a standard HTTP/1.1 200 with the NTRIP source-table media
         // type; v1 uses the legacy `SOURCETABLE 200 OK` status line.
         let hdr = if v2 {
@@ -799,18 +813,22 @@ mod tests {
 
     #[test]
     fn sourcetable_advertises_configured_fields() {
-        let st = build_sourcetable(&cli(&[
-            "-m",
-            "MYBASE",
-            "--identifier",
-            "STATION-X",
-            "--country",
-            "DEU",
-            "--lat",
-            "52.5",
-            "--lon",
-            "13.4",
-        ]));
+        // No decoded position yet → the --lat/--lon fallback is advertised.
+        let st = build_sourcetable(
+            &cli(&[
+                "-m",
+                "MYBASE",
+                "--identifier",
+                "STATION-X",
+                "--country",
+                "DEU",
+                "--lat",
+                "52.5",
+                "--lon",
+                "13.4",
+            ]),
+            None,
+        );
 
         // One STR record for the configured mountpoint, terminated per spec.
         assert!(
@@ -818,8 +836,8 @@ mod tests {
             "STR line should lead with mountpoint + identifier; got: {st:?}"
         );
         assert!(st.contains(";DEU;"), "country code should appear: {st:?}");
-        assert!(st.contains(";52.5000;"), "lat formatted to 4 dp: {st:?}");
-        assert!(st.contains(";13.4000;"), "lon formatted to 4 dp: {st:?}");
+        assert!(st.contains(";52.5000;"), "lat fallback formatted to 4 dp: {st:?}");
+        assert!(st.contains(";13.4000;"), "lon fallback formatted to 4 dp: {st:?}");
         assert!(
             st.ends_with("ENDSOURCETABLE\r\n"),
             "table must be CRLF-terminated with ENDSOURCETABLE: {st:?}"
@@ -830,8 +848,22 @@ mod tests {
 
     #[test]
     fn sourcetable_uses_defaults_when_unset() {
-        let st = build_sourcetable(&cli(&[]));
+        let st = build_sourcetable(&cli(&[]), None);
         assert!(st.starts_with("STR;RTCM3;FM-NTRIP;"), "defaults: {st:?}");
         assert!(st.contains(";USA;"), "default country: {st:?}");
+        // No flags, no decoded position → null island.
+        assert!(st.contains(";0.0000;0.0000;"), "default position: {st:?}");
+    }
+
+    #[test]
+    fn sourcetable_prefers_decoded_position_over_flags() {
+        // A decoded base position must win over the --lat/--lon fallback.
+        let st = build_sourcetable(
+            &cli(&["--lat", "52.5", "--lon", "13.4"]),
+            Some((37.123_456, -122.654_321, 12.0)),
+        );
+        assert!(st.contains(";37.1235;"), "decoded lat advertised: {st:?}");
+        assert!(st.contains(";-122.6543;"), "decoded lon advertised: {st:?}");
+        assert!(!st.contains(";52.5000;"), "flag lat must not be used: {st:?}");
     }
 }

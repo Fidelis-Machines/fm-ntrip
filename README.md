@@ -49,7 +49,9 @@ behind are dropped from the queue rather than stalling the stream.
 
    The serial reader forwards every byte to the broadcast channel (fan-out to
    clients) and also taps a copy through the RTCM decoder to track GNSS state
-   (base position, satellites per constellation) for the once-a-minute heartbeat.
+   (base position, satellites per constellation). That decoded base position
+   feeds the once-a-minute heartbeat and is advertised in the source table, so
+   the station's coordinates self-configure from the hardware.
 ```
 
 ## Build
@@ -128,14 +130,19 @@ To remove everything:
 # Defaults: read /dev/ttyACM0, listen on 0.0.0.0:2101, mountpoint /RTCM3
 fm-ntrip
 
-# Typical base station with credentials and a station location
+# Typical base station with credentials
 fm-ntrip \
   --device /dev/ttyACM0 \
   --listen 0.0.0.0:2101 \
   --mountpoint RTCM3 \
   --username base --password secret \
-  --lat 37.7749 --lon -122.4194 --country USA
+  --country USA
 ```
+
+The station's latitude/longitude in the source table are taken automatically
+from the base position the receiver broadcasts in RTCM `1005`/`1006`, so they
+normally need no configuration. Pass `--lat`/`--lon` only to override that, or as
+a fallback for the brief window before the first position is decoded.
 
 Credentials may also be supplied via the `NTRIP_USER` and `NTRIP_PASS`
 environment variables.
@@ -251,7 +258,7 @@ configured to output RTCM 3).
 | `-u`, `--username` | `user` (`NTRIP_USER`) | HTTP Basic auth username |
 | `-p`, `--password` | `pass` (`NTRIP_PASS`) | HTTP Basic auth password |
 | `--identifier` | `FM-NTRIP` | Source-table station name |
-| `--lat`, `--lon` | `0.0` | Station coordinates in the source table |
+| `--lat`, `--lon` | auto | Coordinates advertised in the source table. Optional — defaults to the base position decoded from the RTCM stream (`1005`/`1006`); these flags are a fallback used until that position is known. |
 | `--country` | `USA` | ISO 3-letter country code |
 | `--queue-size` | `1024` | Per-client broadcast queue capacity |
 | `--log-file` | — | Append logs to this file (in addition to stdout) |

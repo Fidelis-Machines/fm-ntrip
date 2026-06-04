@@ -403,6 +403,72 @@ fn v2_client_dechunks_round_trip() {
     assert_eq!(got, marker, "v2 client should reproduce the original bytes");
 }
 
+#[test]
+fn source_table_advertises_decoded_base_position() {
+    use nix::fcntl::OFlag;
+    use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
+
+    let mut master = posix_openpt(OFlag::O_RDWR).expect("open pty master");
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let slave_path = ptsname_r(&master).expect("slave pty path");
+
+    let caster = Caster::start(&slave_path);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Feed a real RTCM 1005 frame (ECEF for ~37.0°N, 122.0°W) so the caster
+    // decodes the base position from the "hardware".
+    let frame = rtcm_1005_frame(7, -2_702_584.6, -4_325_039.454, 3_817_393.16);
+    master.write_all(&frame).unwrap();
+    master.flush().ok();
+    std::thread::sleep(Duration::from_millis(300)); // let the decode tap run
+
+    let resp = caster.request(&get("", None));
+    assert!(resp.contains("SOURCETABLE 200 OK"), "source table returned");
+    // The advertised lat/lon should be the decoded position (~37°N, ~122°W),
+    // not 0.0000.
+    assert!(
+        resp.contains(";37.") && resp.contains(";-122."),
+        "source table should advertise the decoded base position; got: {resp:?}"
+    );
+    assert!(
+        !resp.contains(";0.0000;0.0000;"),
+        "should not advertise null island once a position is decoded: {resp:?}"
+    );
+}
+
+/// Build a complete RTCM 3 frame carrying a 1005 message for the given ECEF
+/// coordinates (metres). Mirrors the encoder in the rtcm unit tests.
+fn rtcm_1005_frame(station_id: u64, x: f64, y: f64, z: f64) -> Vec<u8> {
+    // 1005 payload: 152 bits, big-endian bit packing.
+    let mut d = vec![0u8; 19];
+    let mut bit = 0usize;
+    let put = |val: u64, len: usize, d: &mut [u8], bit: &mut usize| {
+        for i in (0..len).rev() {
+            let b = ((val >> i) & 1) as u8;
+            d[*bit / 8] |= b << (7 - (*bit % 8));
+            *bit += 1;
+        }
+    };
+    let enc = |v: f64| (v / 0.0001).round() as i64 as u64 & ((1 << 38) - 1);
+    put(1005, 12, &mut d, &mut bit); // message number
+    put(station_id, 12, &mut d, &mut bit); // DF003 reference station ID
+    put(0, 6, &mut d, &mut bit); // DF021 ITRF year
+    put(0, 4, &mut d, &mut bit); // GPS/GLO/GAL/ref-station indicators
+    put(enc(x), 38, &mut d, &mut bit); // DF025 ECEF-X
+    put(0, 2, &mut d, &mut bit); // oscillator + reserved
+    put(enc(y), 38, &mut d, &mut bit); // DF026 ECEF-Y
+    put(0, 2, &mut d, &mut bit); // quarter-cycle indicator
+    put(enc(z), 38, &mut d, &mut bit); // DF027 ECEF-Z
+
+    // Wrap in preamble + 10-bit length + CRC-24Q.
+    let mut f = vec![0xD3, ((d.len() >> 8) & 0x03) as u8, (d.len() & 0xFF) as u8];
+    f.extend_from_slice(&d);
+    let crc = fm_ntrip::rtcm::crc24q(&f);
+    f.extend_from_slice(&[(crc >> 16) as u8, (crc >> 8) as u8, crc as u8]);
+    f
+}
+
 /// Read exactly `n` bytes (honouring the socket read timeout) and return them.
 fn read_exact_n(s: &mut TcpStream, n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
