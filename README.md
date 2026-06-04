@@ -57,8 +57,8 @@ auto-detects the repo location and can be run from anywhere.
 | Script | Purpose |
 |--------|---------|
 | [`scripts/install-devel.sh`](scripts/install-devel.sh) | Install Rust + build prerequisites, grant serial (`dialout`) access, and build the release binary. |
-| [`scripts/install-service.sh`](scripts/install-service.sh) | Install the binary, credentials file, and systemd unit, then enable + start the service. |
-| [`scripts/uninstall-service.sh`](scripts/uninstall-service.sh) | Stop, disable, and remove the service and binary (`--purge` also removes credentials). |
+| [`scripts/install-service.sh`](scripts/install-service.sh) | Install the binary, credentials file, systemd unit, and logrotate rule, then enable + start the service. |
+| [`scripts/uninstall-service.sh`](scripts/uninstall-service.sh) | Stop, disable, and remove the service, binary, and logrotate rule (`--purge` also removes credentials + logs). |
 
 Typical first-time setup on the Pi:
 
@@ -66,7 +66,7 @@ Typical first-time setup on the Pi:
 cd ~/fm-trip
 ./scripts/install-devel.sh      # install Rust + toolchain, build the binary
 ./scripts/install-service.sh    # install + start the systemd service
-journalctl -u fm-ntrip -f       # watch the logs
+tail -f /var/log/fm-ntrip.log   # watch the logs
 ```
 
 `install-service.sh` installs:
@@ -75,7 +75,8 @@ journalctl -u fm-ntrip -f       # watch the logs
 - a credentials file at `/etc/fm-ntrip/fm-ntrip.env` (mode `0600`; an existing
   one is never overwritten),
 - the unit at `/etc/systemd/system/fm-ntrip.service`, with `User=` set to the
-  invoking account.
+  invoking account,
+- a `logrotate` rule at `/etc/logrotate.d/fm-ntrip` that caps the log file.
 
 Useful overrides:
 
@@ -88,9 +89,12 @@ ENABLE_NOW=0       ./scripts/install-service.sh   # install without starting
 > with `NTRIP_PASS=change-me`. Edit `/etc/fm-ntrip/fm-ntrip.env` and run
 > `sudo systemctl restart fm-ntrip`.
 
-The unit and its template live under [`systemd/`](systemd/) if you prefer to
-install by hand. Logs (startup, rover connect/disconnect, hourly heartbeats) go
-to the journal — see [Logging](#logging).
+The unit, env template, and logrotate rule live under [`systemd/`](systemd/) if
+you prefer to install by hand. The service redirects both streams to
+`/var/log/fm-ntrip.log` (startup, rover connect/disconnect, hourly heartbeats);
+see [Logging](#logging). Tail it with `tail -f /var/log/fm-ntrip.log`. The file
+is appended across restarts and rotated weekly (or at 50 MB, 8 kept) by the
+installed `logrotate` rule.
 
 To remove everything:
 
@@ -193,9 +197,15 @@ configured to output RTCM 3).
 
 ## Logging
 
-The server logs its lifecycle and connection activity to stdout, and
-optionally to a file. Verbosity is controlled by the `-v`/`-vv` flags or the
-`RUST_LOG` environment variable (e.g. `RUST_LOG=fm_ntrip=debug`).
+The server logs its lifecycle and connection activity, split across the two
+standard streams:
+
+- **stdout** — `INFO`, `DEBUG`, `TRACE` (normal operation and diagnostics)
+- **stderr** — `WARN`, `ERROR` (problems, so they can be redirected separately)
+
+Which levels are emitted is controlled by the `-v`/`-vv` flags or the `RUST_LOG`
+environment variable (e.g. `RUST_LOG=fm_ntrip=debug`); the stream split applies
+within whatever is emitted.
 
 Logged events include:
 
@@ -218,15 +228,20 @@ INFO 10.0.0.5:55058 rover disconnected (1843200 bytes sent) — 0 client(s) stil
 WARN heartbeat: serial port OPEN but received NO data in last 3600s — receiver stalled? — 0 client(s)
 ```
 
-To capture logs to a file when running as a daemon:
+### Logging to a file
+
+The built-in `--log-file` option writes a copy of **every** level (both streams)
+to a file, without ANSI colour codes:
 
 ```sh
-fm-ntrip --log-file /var/log/fm-ntrip.log
+fm-ntrip --log-file /tmp/fm-ntrip.log
 ```
 
-The file receives the same lines without ANSI colour codes. When running under
-systemd, stdout is already captured by the journal, so `--log-file` is mainly
-useful for standalone runs.
+When running under systemd, the provided unit instead redirects both stdout and
+stderr to `/var/log/fm-ntrip.log` at the service level (`StandardOutput=` /
+`StandardError=append:`), so the file holds the complete log and the
+service manager handles file creation. Either way, the file grows unbounded —
+add a `logrotate` rule to cap its size.
 
 ## Notes
 

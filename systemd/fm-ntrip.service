@@ -22,14 +22,22 @@ SupplementaryGroups=dialout
 EnvironmentFile=/etc/fm-ntrip/fm-ntrip.env
 
 # --- Command --------------------------------------------------------------
-# Logs go to stdout, which systemd captures in the journal (journalctl).
-# The hourly heartbeat and connect/disconnect lines land there automatically.
+# The binary splits logs across stdout (INFO/DEBUG/TRACE) and stderr
+# (WARN/ERROR); both streams are redirected to the log file below, so the file
+# holds the complete log. systemd opens/creates the file as the service manager
+# and hands the descriptor to the (unprivileged) process, so no special
+# ownership of /var/log is required.
 ExecStart=/usr/local/bin/fm-ntrip \
     --device /dev/ttyACM0 \
     --baud 115200 \
     --listen 0.0.0.0:2101 \
     --mountpoint RTCM3 \
     --heartbeat-secs 3600
+
+# --- Logging --------------------------------------------------------------
+# Append (don't truncate) so logs survive restarts. Use `logrotate` to cap size.
+StandardOutput=append:/var/log/fm-ntrip.log
+StandardError=append:/var/log/fm-ntrip.log
 
 # --- Restart policy -------------------------------------------------------
 # The process is long-lived and reconnects to the receiver internally; restart

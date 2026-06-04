@@ -21,6 +21,7 @@ BIN_DEST=/usr/local/bin/fm-ntrip
 UNIT_DEST=/etc/systemd/system/fm-ntrip.service
 ENV_DIR=/etc/fm-ntrip
 ENV_DEST="${ENV_DIR}/fm-ntrip.env"
+LOGROTATE_DEST=/etc/logrotate.d/fm-ntrip
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
@@ -53,6 +54,7 @@ find_repo() {
 REPO_DIR="$(find_repo "${1:-}")" || die "Could not find the fm-ntrip checkout. Pass its path: $0 /path/to/fm-trip"
 UNIT_SRC="${REPO_DIR}/systemd/fm-ntrip.service"
 ENV_SRC="${REPO_DIR}/systemd/fm-ntrip.env.example"
+LOGROTATE_SRC="${REPO_DIR}/systemd/fm-ntrip.logrotate"
 [[ -f "$UNIT_SRC" ]] || die "unit template not found at $UNIT_SRC"
 [[ -f "$ENV_SRC"  ]] || die "env template not found at $ENV_SRC"
 
@@ -87,6 +89,14 @@ trap 'rm -f "$tmp_unit"' EXIT
 sed "s/^User=.*/User=${SERVICE_USER}/" "$UNIT_SRC" > "$tmp_unit"
 sudo install -m 0644 "$tmp_unit" "$UNIT_DEST"
 
+# --- Log rotation -----------------------------------------------------------
+if [[ -f "$LOGROTATE_SRC" ]]; then
+    log "Installing logrotate rule → ${LOGROTATE_DEST}"
+    sudo install -m 0644 "$LOGROTATE_SRC" "$LOGROTATE_DEST"
+else
+    warn "logrotate template not found at $LOGROTATE_SRC — skipping (log file will grow unbounded)"
+fi
+
 # --- Serial-port access -----------------------------------------------------
 if id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -qx dialout; then
     log "User '$SERVICE_USER' is in the 'dialout' group (serial access OK)"
@@ -110,6 +120,6 @@ fi
 
 echo
 log "Done."
-echo "  Logs:    journalctl -u fm-ntrip -f"
+echo "  Logs:    tail -f /var/log/fm-ntrip.log  (rotated by ${LOGROTATE_DEST})"
 echo "  Status:  systemctl status fm-ntrip"
 echo "  Config:  ${ENV_DEST}  and  ${UNIT_DEST}"

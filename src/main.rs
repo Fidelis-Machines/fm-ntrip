@@ -126,6 +126,7 @@ async fn run_serial_reader(
                 info!("Serial port {} open", device);
                 stats.serial_up.store(true, Ordering::Relaxed);
                 let mut buf = [0u8; 4096];
+                let mut got_data = false; // log the first bytes of each connection
                 loop {
                     match port.read(&mut buf).await {
                         Ok(0) => {
@@ -133,6 +134,10 @@ async fn run_serial_reader(
                             break;
                         }
                         Ok(n) => {
+                            if !got_data {
+                                got_data = true;
+                                info!("Receiving data from {} ({} bytes in first read)", device, n);
+                            }
                             debug!("serial: {} bytes", n);
                             stats.serial_bytes.fetch_add(n as u64, Ordering::Relaxed);
                             // Drop on no-subscribers is fine.
@@ -503,6 +508,7 @@ async fn handle_client(
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 || parts[0] != "GET" {
+        debug!("{} malformed request {:?} — 400", peer, request_line);
         let _ = write_half
             .write_all(b"HTTP/1.0 400 Bad Request\r\nConnection: close\r\n\r\n")
             .await;
@@ -530,7 +536,10 @@ async fn handle_client(
 
     // Mountpoint match.
     if path != cli.mountpoint {
-        debug!("{} requested unknown mountpoint {:?}", peer, path);
+        warn!(
+            "{} requested unknown mountpoint {:?} (have /{}) — 404",
+            peer, path, cli.mountpoint
+        );
         let _ = write_half
             .write_all(b"HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n")
             .await;
@@ -541,7 +550,12 @@ async fn handle_client(
     let expected = base64::engine::general_purpose::STANDARD
         .encode(format!("{}:{}", cli.username, cli.password));
     if auth_b64.as_deref() != Some(expected.as_str()) {
-        debug!("{} auth failed", peer);
+        warn!(
+            "{} authentication failed for /{} (ua={}) — 401",
+            peer,
+            cli.mountpoint,
+            user_agent.as_deref().unwrap_or("-")
+        );
         let _ = write_half
             .write_all(
                 b"HTTP/1.0 401 Unauthorized\r\n\
@@ -607,13 +621,36 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("fm_ntrip={level}")))
     };
 
-    // Always log to stdout; additionally append to a file when --log-file is set.
-    // The worker guard must outlive the program, so it's held for all of main.
+    // Logs are split by severity across the standard streams:
+    //   INFO / DEBUG / TRACE  → stdout   (normal operation, diagnostics)
+    //   WARN / ERROR          → stderr   (problems, redirectable separately)
+    // The active levels are still gated by --verbose / RUST_LOG above; this only
+    // chooses which stream each emitted level goes to. A --log-file, when set,
+    // additionally captures every level (both streams) without colour codes.
+    //
+    // The file-writer worker guard must outlive the program, so it's held for
+    // all of main.
     let _log_guard = {
+        use tracing_subscriber::filter::filter_fn;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
 
-        let stdout_layer = tracing_subscriber::fmt::layer().with_target(false);
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stdout)
+            .with_filter(filter_fn(|meta| {
+                matches!(
+                    *meta.level(),
+                    tracing::Level::INFO | tracing::Level::DEBUG | tracing::Level::TRACE
+                )
+            }));
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .with_filter(filter_fn(|meta| {
+                matches!(*meta.level(), tracing::Level::WARN | tracing::Level::ERROR)
+            }));
 
         match &cli.log_file {
             Some(path) => {
@@ -630,6 +667,7 @@ async fn main() -> Result<()> {
                 tracing_subscriber::registry()
                     .with(filter())
                     .with(stdout_layer)
+                    .with(stderr_layer)
                     .with(file_layer)
                     .init();
                 Some(guard)
@@ -638,11 +676,18 @@ async fn main() -> Result<()> {
                 tracing_subscriber::registry()
                     .with(filter())
                     .with(stdout_layer)
+                    .with(stderr_layer)
                     .init();
                 None
             }
         }
     };
+
+    info!(
+        "Starting {} v{}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Self-test mode: verify we can talk to the hardware, then exit.
     if cli.test {
@@ -681,23 +726,43 @@ async fn main() -> Result<()> {
         cli.listen, cli.mountpoint, cli.username
     );
 
+    // SIGTERM is how systemd (and most service managers) ask us to stop;
+    // SIGINT is Ctrl-C at a terminal. Handle both for a clean shutdown.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+
     let cli = Arc::new(cli);
     loop {
         tokio::select! {
             res = listener.accept() => {
-                let (sock, peer) = res?;
-                let _ = sock.set_nodelay(true);
-                let rx = tx.subscribe();
-                let cli = cli.clone();
-                let stats = stats.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(sock, peer, cli, rx, stats).await {
-                        debug!("client {} error: {e}", peer);
+                match res {
+                    Ok((sock, peer)) => {
+                        let _ = sock.set_nodelay(true);
+                        let rx = tx.subscribe();
+                        let cli = cli.clone();
+                        let stats = stats.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(sock, peer, cli, rx, stats).await {
+                                debug!("client {} error: {e}", peer);
+                            }
+                        });
                     }
-                });
+                    // A transient accept error (fd exhaustion, aborted connection)
+                    // must not take the whole caster down — log and keep serving.
+                    Err(e) => {
+                        warn!("accept failed: {e} — continuing");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("SIGINT — shutting down");
+                let n = stats.clients.load(Ordering::Relaxed);
+                info!("SIGINT received — shutting down ({n} client(s) connected)");
+                return Ok(());
+            }
+            _ = sigterm.recv() => {
+                let n = stats.clients.load(Ordering::Relaxed);
+                info!("SIGTERM received — shutting down ({n} client(s) connected)");
                 return Ok(());
             }
         }

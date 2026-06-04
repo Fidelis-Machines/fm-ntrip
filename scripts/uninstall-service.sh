@@ -14,6 +14,8 @@ BIN_DEST=/usr/local/bin/fm-ntrip
 UNIT_DEST=/etc/systemd/system/fm-ntrip.service
 ENV_DIR=/etc/fm-ntrip
 ENV_DEST="${ENV_DIR}/fm-ntrip.env"
+LOGROTATE_DEST=/etc/logrotate.d/fm-ntrip
+LOG_FILE=/var/log/fm-ntrip.log
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
@@ -38,6 +40,11 @@ if [[ -f "$UNIT_DEST" ]]; then
     sudo rm -f "$UNIT_DEST"
 fi
 
+if [[ -f "$LOGROTATE_DEST" ]]; then
+    log "Removing logrotate rule ${LOGROTATE_DEST}"
+    sudo rm -f "$LOGROTATE_DEST"
+fi
+
 log "Reloading systemd"
 sudo systemctl daemon-reload
 sudo systemctl reset-failed fm-ntrip.service 2>/dev/null || true
@@ -52,8 +59,13 @@ if [[ $PURGE -eq 1 ]]; then
         log "Purging credentials ${ENV_DIR}"
         sudo rm -rf "$ENV_DIR"
     fi
+    if [[ -e "$LOG_FILE" ]]; then
+        log "Purging log file ${LOG_FILE}*"
+        sudo rm -f "${LOG_FILE}" "${LOG_FILE}".*
+    fi
 else
     [[ -f "$ENV_DEST" ]] && warn "Left credentials in place: ${ENV_DEST} (use --purge to remove)"
+    [[ -f "$LOG_FILE" ]] && warn "Left logs in place: ${LOG_FILE} (use --purge to remove)"
 fi
 
 log "Done. fm-ntrip service removed."

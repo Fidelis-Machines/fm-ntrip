@@ -1,0 +1,14 @@
+# Logrotate rule for fm-ntrip — install to /etc/logrotate.d/fm-ntrip.
+# Keeps the service log (/var/log/fm-ntrip.log) from growing unbounded.
+/var/log/fm-ntrip.log {
+    weekly
+    rotate 8
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    # The service appends with O_APPEND via a systemd-held descriptor, so the
+    # file can be rotated in place by truncation without restarting the service.
+    copytruncate
+}
