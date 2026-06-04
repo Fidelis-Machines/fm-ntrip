@@ -72,6 +72,54 @@ Point any NTRIP client at the host, port `2101`, mountpoint `RTCM3`, with the
 configured username and password. Fetching the root path (`GET /`) returns the
 NTRIP source table describing the available mountpoint.
 
+### Hardware self-test
+
+Before relying on the caster, run the built-in self-test to confirm the server
+can actually talk to the receiver. With the simpleRTK2B connected, run:
+
+```sh
+fm-ntrip --test                 # read /dev/ttyACM0 for 10 s and report
+fm-ntrip --test --test-secs 30  # read longer
+```
+
+This mode does **not** start the network caster. It opens the serial device,
+reads the live stream for a few seconds, validates each RTCM 3 frame
+(preamble + length + CRC-24Q), decodes a few human-readable readings, and
+prints a report. It exits `0` if a valid stream was seen and non-zero
+otherwise — so it can be used as a health check in scripts or systemd.
+
+```text
+fm-ntrip self-test: opening /dev/ttyACM0 @ 115200 baud …
+  serial port opened OK
+  reading for 10 s — verifying RTCM 3 framing + CRC-24Q …
+
+  [1005] base station #0 antenna reference position:
+        XX.XXXXXXX°N  XXX.XXXXXXX°W  height XX.XX m
+        ECEF  X=-XXXXXXX.XXX  Y=-XXXXXXX.XXX  Z=XXXXXXX.XXX  (metres)
+  [1077] GPS observations (MSM) — 9 satellites tracked
+  [1087] GLONASS observations (MSM) — 6 satellites tracked
+  [1097] Galileo observations (MSM) — 7 satellites tracked
+  [1230] GLONASS code-phase biases
+
+── self-test report ───────────────────────────────
+  bytes read      : 4821
+  valid frames    : 38
+  CRC errors      : 0
+  message types   :
+        1005  ×1
+        1077  ×10
+        1087  ×10
+        1097  ×10
+        1230  ×1
+───────────────────────────────────────────────────
+
+✓ PASS — hardware is producing a valid RTCM 3 stream.
+```
+
+If no bytes arrive, or bytes arrive but no frame passes its CRC, the test fails
+with a diagnostic hint (receiver not powered/enumerated, wrong device, or not
+configured to output RTCM 3).
+
 ### Options
 
 | Flag | Default | Description |
@@ -86,15 +134,54 @@ NTRIP source table describing the available mountpoint.
 | `--lat`, `--lon` | `0.0` | Station coordinates in the source table |
 | `--country` | `USA` | ISO 3-letter country code |
 | `--queue-size` | `1024` | Per-client broadcast queue capacity |
+| `--log-file` | — | Append logs to this file (in addition to stdout) |
+| `--heartbeat-secs` | `3600` | Interval between hardware status heartbeats (`0` disables) |
+| `-t`, `--test` | — | Hardware self-test: verify the RTCM 3 stream and exit (no caster) |
+| `--test-secs` | `10` | Seconds the self-test reads from the device before reporting |
 | `-v`, `--verbose` | — | Increase log verbosity (`-v` debug, `-vv` trace) |
+
+## Logging
+
+The server logs its lifecycle and connection activity to stdout, and
+optionally to a file. Verbosity is controlled by the `-v`/`-vv` flags or the
+`RUST_LOG` environment variable (e.g. `RUST_LOG=fm_ntrip=debug`).
+
+Logged events include:
+
+- **Startup** — listen address, mountpoint, and serial device.
+- **Serial link** — port open/close and automatic reconnects.
+- **Rover connect/disconnect** — peer address, user-agent, and the running
+  count of connected clients; on disconnect, the number of bytes streamed.
+- **Heartbeat** — every `--heartbeat-secs` (hourly by default), a line
+  reporting whether the serial link is up, how much data arrived in the
+  interval, and how many clients are connected. If the port is open but no data
+  is arriving (a stalled receiver), or the port is down, it logs a warning. This
+  gives you a periodic health signal even when no rovers are connected.
+
+```text
+INFO Listening on 0.0.0.0:2101 (mountpoint=/RTCM3 user=base)
+INFO Serial port /dev/ttyACM0 open
+INFO 10.0.0.5:55058 rover connected to /RTCM3 (ua=NTRIP testrover) — 1 client(s) now connected
+INFO heartbeat: serial link UP — 1843200 bytes in 3600s (512 B/s), 1 client(s) connected
+INFO 10.0.0.5:55058 rover disconnected (1843200 bytes sent) — 0 client(s) still connected
+WARN heartbeat: serial port OPEN but received NO data in last 3600s — receiver stalled? — 0 client(s)
+```
+
+To capture logs to a file when running as a daemon:
+
+```sh
+fm-ntrip --log-file /var/log/fm-ntrip.log
+```
+
+The file receives the same lines without ANSI colour codes. When running under
+systemd, stdout is already captured by the journal, so `--log-file` is mainly
+useful for standalone runs.
 
 ## Notes
 
 - Clients are upgraded with the NTRIP v1 `ICY 200 OK` response, which `str2str`,
   u-center, and most NTRIP clients accept. Pure HTTP/1.1 NTRIP v2 is not
   implemented.
-- Logging is controlled by the `RUST_LOG` environment variable
-  (e.g. `RUST_LOG=fm_ntrip=debug`) or the `-v` flags.
 
 ## License
 
