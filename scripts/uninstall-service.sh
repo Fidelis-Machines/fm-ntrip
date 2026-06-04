@@ -2,18 +2,18 @@
 #
 # uninstall-service.sh — Remove the fm-ntrip systemd service from the Pi.
 #
-# Stops and disables the service and removes the unit and binary. The
-# credentials file is left in place by default (it holds your password); pass
-# --purge to remove it and /etc/fm-ntrip too.
+# Stops and disables the service, removes the unit, logrotate rule, and the
+# /opt/fm-ntrip binaries + scripts. The credentials directory (/opt/fm-ntrip/etc)
+# is left in place by default (it holds your password); pass --purge to remove
+# the whole /opt/fm-ntrip tree and the log file too.
 #
 # Usage: ./scripts/uninstall-service.sh [--purge]
 #
 set -euo pipefail
 
-BIN_DEST=/usr/local/bin/fm-ntrip
+PREFIX=/opt/fm-ntrip
+ETC_DIR="${PREFIX}/etc"
 UNIT_DEST=/etc/systemd/system/fm-ntrip.service
-ENV_DIR=/etc/fm-ntrip
-ENV_DEST="${ENV_DIR}/fm-ntrip.env"
 LOGROTATE_DEST=/etc/logrotate.d/fm-ntrip
 LOG_FILE=/var/log/fm-ntrip.log
 
@@ -49,22 +49,20 @@ log "Reloading systemd"
 sudo systemctl daemon-reload
 sudo systemctl reset-failed fm-ntrip.service 2>/dev/null || true
 
-if [[ -e "$BIN_DEST" ]]; then
-    log "Removing binary ${BIN_DEST}"
-    sudo rm -f "$BIN_DEST"
-fi
-
 if [[ $PURGE -eq 1 ]]; then
-    if [[ -e "$ENV_DEST" || -d "$ENV_DIR" ]]; then
-        log "Purging credentials ${ENV_DIR}"
-        sudo rm -rf "$ENV_DIR"
+    if [[ -d "$PREFIX" ]]; then
+        log "Purging install tree ${PREFIX}"
+        sudo rm -rf "$PREFIX"
     fi
     if [[ -e "$LOG_FILE" ]]; then
         log "Purging log file ${LOG_FILE}*"
         sudo rm -f "${LOG_FILE}" "${LOG_FILE}".*
     fi
 else
-    [[ -f "$ENV_DEST" ]] && warn "Left credentials in place: ${ENV_DEST} (use --purge to remove)"
+    # Remove binaries and scripts, but preserve the credentials in etc/.
+    log "Removing ${PREFIX}/bin and ${PREFIX}/scripts"
+    sudo rm -rf "${PREFIX}/bin" "${PREFIX}/scripts"
+    [[ -d "$ETC_DIR" ]] && warn "Left credentials in place: ${ETC_DIR} (use --purge to remove)"
     [[ -f "$LOG_FILE" ]] && warn "Left logs in place: ${LOG_FILE} (use --purge to remove)"
 fi
 

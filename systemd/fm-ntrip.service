@@ -19,7 +19,7 @@ SupplementaryGroups=dialout
 # --- Credentials ----------------------------------------------------------
 # NTRIP_USER / NTRIP_PASS are read from this file so they stay out of the unit
 # (and out of `ps`). See fm-ntrip.env.example. Mark it 0600.
-EnvironmentFile=/etc/fm-ntrip/fm-ntrip.env
+EnvironmentFile=/opt/fm-ntrip/etc/fm-ntrip.env
 
 # --- Command --------------------------------------------------------------
 # The binary splits logs across stdout (INFO/DEBUG/TRACE) and stderr
@@ -27,7 +27,7 @@ EnvironmentFile=/etc/fm-ntrip/fm-ntrip.env
 # holds the complete log. systemd opens/creates the file as the service manager
 # and hands the descriptor to the (unprivileged) process, so no special
 # ownership of /var/log is required.
-ExecStart=/usr/local/bin/fm-ntrip \
+ExecStart=/opt/fm-ntrip/bin/fm-ntrip \
     --device /dev/ttyACM0 \
     --baud 115200 \
     --listen 0.0.0.0:2101 \

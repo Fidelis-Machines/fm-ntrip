@@ -71,8 +71,8 @@ auto-detects the repo location and can be run from anywhere.
 | Script | Purpose |
 |--------|---------|
 | [`scripts/install-devel.sh`](scripts/install-devel.sh) | Install Rust + build prerequisites, grant serial (`dialout`) access, and build the release binary. |
-| [`scripts/install-service.sh`](scripts/install-service.sh) | Install the binary, credentials file, systemd unit, and logrotate rule, then enable + start the service. |
-| [`scripts/uninstall-service.sh`](scripts/uninstall-service.sh) | Stop, disable, and remove the service, binary, and logrotate rule (`--purge` also removes credentials + logs). |
+| [`scripts/install-service.sh`](scripts/install-service.sh) | Install both binaries, scripts, and credentials under `/opt/fm-ntrip`, plus the systemd unit and logrotate rule, then enable + start the service. |
+| [`scripts/uninstall-service.sh`](scripts/uninstall-service.sh) | Stop, disable, and remove the service, unit, logrotate rule, and `/opt/fm-ntrip` binaries/scripts (`--purge` also removes credentials + logs). |
 
 Typical first-time setup on the Pi:
 
@@ -83,11 +83,16 @@ cd ~/fm-trip
 tail -f /var/log/fm-ntrip.log   # watch the logs
 ```
 
-`install-service.sh` installs:
+`install-service.sh` installs a self-contained tree under `/opt/fm-ntrip`:
 
-- the binary to `/usr/local/bin/fm-ntrip`,
-- a credentials file at `/etc/fm-ntrip/fm-ntrip.env` (mode `0600`; an existing
-  one is never overwritten),
+- both binaries to `/opt/fm-ntrip/bin/` (`fm-ntrip` and `fm-ntrip-client`),
+- the helper scripts to `/opt/fm-ntrip/scripts/`,
+- a credentials file at `/opt/fm-ntrip/etc/fm-ntrip.env` (mode `0600`; an
+  existing one is never overwritten),
+
+plus the OS-integration files in their required locations (both reference the
+`/opt` paths):
+
 - the unit at `/etc/systemd/system/fm-ntrip.service`, with `User=` set to the
   invoking account,
 - a `logrotate` rule at `/etc/logrotate.d/fm-ntrip` that caps the log file.
@@ -100,7 +105,7 @@ ENABLE_NOW=0       ./scripts/install-service.sh   # install without starting
 ```
 
 > **Set a password before exposing the caster.** The credentials file ships
-> with `NTRIP_PASS=change-me`. Edit `/etc/fm-ntrip/fm-ntrip.env` and run
+> with `NTRIP_PASS=change-me`. Edit `/opt/fm-ntrip/etc/fm-ntrip.env` and run
 > `sudo systemctl restart fm-ntrip`.
 
 The unit, env template, and logrotate rule live under [`systemd/`](systemd/) if

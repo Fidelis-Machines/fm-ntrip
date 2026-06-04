@@ -2,10 +2,14 @@
 #
 # install-service.sh — Install fm-ntrip as a systemd service on the Raspberry Pi.
 #
-# Installs the binary to /usr/local/bin, the credentials file to
-# /etc/fm-ntrip/, and the unit to /etc/systemd/system/, then reloads systemd.
+# Self-contained install under /opt/fm-ntrip:
+#   /opt/fm-ntrip/bin       fm-ntrip + fm-ntrip-client binaries
+#   /opt/fm-ntrip/scripts   these helper scripts
+#   /opt/fm-ntrip/etc       fm-ntrip.env credentials
+# The systemd unit (/etc/systemd/system) and logrotate rule
+# (/etc/logrotate.d) live in their required system dirs but point at /opt.
 # The service User= is set to the invoking user (so it can open the serial
-# device via the dialout group). Builds the release binary first if missing.
+# device via the dialout group). Builds the release binaries first if missing.
 #
 # Usage: ./scripts/install-service.sh [REPO_DIR]
 #
@@ -17,10 +21,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-BIN_DEST=/usr/local/bin/fm-ntrip
+PREFIX=/opt/fm-ntrip
+BIN_DIR="${PREFIX}/bin"
+SCRIPTS_DIR="${PREFIX}/scripts"
+ETC_DIR="${PREFIX}/etc"
+ENV_DEST="${ETC_DIR}/fm-ntrip.env"
 UNIT_DEST=/etc/systemd/system/fm-ntrip.service
-ENV_DIR=/etc/fm-ntrip
-ENV_DEST="${ENV_DIR}/fm-ntrip.env"
 LOGROTATE_DEST=/etc/logrotate.d/fm-ntrip
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -58,21 +64,30 @@ LOGROTATE_SRC="${REPO_DIR}/systemd/fm-ntrip.logrotate"
 [[ -f "$UNIT_SRC" ]] || die "unit template not found at $UNIT_SRC"
 [[ -f "$ENV_SRC"  ]] || die "env template not found at $ENV_SRC"
 
-# --- Binary -----------------------------------------------------------------
-BIN_SRC="${REPO_DIR}/target/release/fm-ntrip"
-if [[ ! -x "$BIN_SRC" ]]; then
-    log "Release binary not built yet — building (this can take several minutes)"
+# --- Binaries ---------------------------------------------------------------
+SERVER_SRC="${REPO_DIR}/target/release/fm-ntrip"
+CLIENT_SRC="${REPO_DIR}/target/release/fm-ntrip-client"
+if [[ ! -x "$SERVER_SRC" || ! -x "$CLIENT_SRC" ]]; then
+    log "Release binaries not built yet — building (this can take several minutes)"
     command -v cargo >/dev/null 2>&1 || { [[ -f "${HOME}/.cargo/env" ]] && . "${HOME}/.cargo/env"; }
     command -v cargo >/dev/null 2>&1 || die "cargo not found. Run scripts/install-devel.sh first to install Rust."
     cargo build --release --manifest-path "${REPO_DIR}/Cargo.toml"
 fi
-[[ -x "$BIN_SRC" ]] || die "binary still missing at $BIN_SRC"
+[[ -x "$SERVER_SRC" ]] || die "server binary still missing at $SERVER_SRC"
+[[ -x "$CLIENT_SRC" ]] || die "client binary still missing at $CLIENT_SRC"
 
-log "Installing binary → ${BIN_DEST}"
-sudo install -m 0755 "$BIN_SRC" "$BIN_DEST"
+log "Installing binaries → ${BIN_DIR}"
+sudo install -d -m 0755 "$BIN_DIR"
+sudo install -m 0755 "$SERVER_SRC" "${BIN_DIR}/fm-ntrip"
+sudo install -m 0755 "$CLIENT_SRC" "${BIN_DIR}/fm-ntrip-client"
+
+# --- Scripts ----------------------------------------------------------------
+log "Installing scripts → ${SCRIPTS_DIR}"
+sudo install -d -m 0755 "$SCRIPTS_DIR"
+sudo install -m 0755 "${REPO_DIR}/scripts/"*.sh "$SCRIPTS_DIR"/
 
 # --- Credentials file -------------------------------------------------------
-sudo mkdir -p "$ENV_DIR"
+sudo install -d -m 0755 "$ETC_DIR"
 if [[ -f "$ENV_DEST" ]]; then
     log "Credentials file already exists → ${ENV_DEST} (left unchanged)"
 else
@@ -119,7 +134,9 @@ else
 fi
 
 echo
-log "Done."
+log "Done. Installed under ${PREFIX}"
+echo "  Server:  ${BIN_DIR}/fm-ntrip"
+echo "  Client:  ${BIN_DIR}/fm-ntrip-client"
 echo "  Logs:    tail -f /var/log/fm-ntrip.log  (rotated by ${LOGROTATE_DEST})"
 echo "  Status:  systemctl status fm-ntrip"
 echo "  Config:  ${ENV_DEST}  and  ${UNIT_DEST}"
