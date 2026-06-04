@@ -31,7 +31,9 @@ find_repo() {
         "${SCRIPT_DIR}/.."       # script lives in <repo>/scripts/
         "${SCRIPT_DIR}"          # script lives at repo root
         "${PWD}"                 # invoked from inside the repo
-        "${PWD}/fm-trip"         # repo cloned under cwd
+        "${PWD}/fm-ntrip"        # repo cloned under cwd
+        "${HOME}/fm-ntrip"
+        "${PWD}/fm-trip"         # legacy name, before the fm-ntrip rename
         "${HOME}/fm-trip"
     )
     local c
@@ -42,7 +44,7 @@ find_repo() {
     return 1
 }
 
-REPO_DIR="$(find_repo "${1:-}")" || die "Could not find the fm-ntrip checkout. Run this from inside the repo, or pass its path: $0 /path/to/fm-trip"
+REPO_DIR="$(find_repo "${1:-}")" || die "Could not find the fm-ntrip checkout. Run this from inside the repo, or pass its path: $0 /path/to/fm-ntrip"
 
 [[ $EUID -eq 0 ]] && die "Do not run as root. Run as your normal user; the script calls sudo where needed."
 

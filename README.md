@@ -77,7 +77,7 @@ auto-detects the repo location and can be run from anywhere.
 Typical first-time setup on the Pi:
 
 ```sh
-cd ~/fm-trip
+cd ~/fm-ntrip
 ./scripts/install-devel.sh      # install Rust + toolchain, build the binary
 ./scripts/install-service.sh    # install + start the systemd service
 tail -f /var/log/fm-ntrip.log   # watch the logs

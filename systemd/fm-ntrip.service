@@ -1,6 +1,6 @@
 [Unit]
 Description=fm-ntrip — NTRIP server/caster (simpleRTK2B RTCM → NTRIP clients)
-Documentation=https://github.com/shieldwolf/fm-ntrip
+Documentation=https://github.com/Fidelis-Machines/fm-ntrip
 # Start after the network is up; the serial reader retries on its own if the
 # receiver isn't enumerated yet, so we don't gate on the device here.
 After=network-online.target

@@ -47,7 +47,8 @@ find_repo() {
     local candidates=(
         "${FM_NTRIP_DIR:-}" "${1:-}"
         "${SCRIPT_DIR}/.." "${SCRIPT_DIR}"
-        "${PWD}" "${PWD}/fm-trip" "${HOME}/fm-trip"
+        "${PWD}" "${PWD}/fm-ntrip" "${HOME}/fm-ntrip"
+        "${PWD}/fm-trip" "${HOME}/fm-trip" # legacy name, before the fm-ntrip rename
     )
     local c
     for c in "${candidates[@]}"; do
@@ -57,7 +58,7 @@ find_repo() {
     return 1
 }
 
-REPO_DIR="$(find_repo "${1:-}")" || die "Could not find the fm-ntrip checkout. Pass its path: $0 /path/to/fm-trip"
+REPO_DIR="$(find_repo "${1:-}")" || die "Could not find the fm-ntrip checkout. Pass its path: $0 /path/to/fm-ntrip"
 UNIT_SRC="${REPO_DIR}/systemd/fm-ntrip.service"
 ENV_SRC="${REPO_DIR}/systemd/fm-ntrip.env.example"
 LOGROTATE_SRC="${REPO_DIR}/systemd/fm-ntrip.logrotate"
