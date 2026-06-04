@@ -5,10 +5,10 @@
 // and rebroadcasts it to any NTRIP client that authenticates against the
 // configured mountpoint.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -21,7 +21,9 @@ use tokio::time::timeout;
 use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, error, info, warn};
 
-/// Shared, lock-free server state used for connection logging and heartbeats.
+use fm_ntrip::rtcm;
+
+/// Shared server state used for connection logging and heartbeats.
 #[derive(Default)]
 struct ServerStats {
     /// Whether the serial port is currently open.
@@ -30,6 +32,59 @@ struct ServerStats {
     serial_bytes: AtomicU64,
     /// Number of currently connected NTRIP clients (rovers).
     clients: AtomicUsize,
+    /// Latest GNSS/hardware info decoded from the RTCM stream.
+    gnss: Mutex<GnssData>,
+}
+
+/// Decoded GNSS/hardware status, updated as RTCM messages flow through.
+#[derive(Default)]
+struct GnssData {
+    /// Latest satellite count per constellation (e.g. "GPS" → 9).
+    sats: BTreeMap<&'static str, u32>,
+    /// Base station antenna reference position (lat°, lon°, height m).
+    pos: Option<(f64, f64, f64)>,
+    /// Reference station ID from the position message.
+    station_id: Option<u16>,
+    /// Distinct RTCM message types seen.
+    types: BTreeSet<u16>,
+    /// Whether the one-time startup hardware summary has been logged.
+    announced: bool,
+}
+
+impl GnssData {
+    /// "GPS:9 GLO:6 GAL:7" style satellite summary.
+    fn sats_line(&self) -> String {
+        if self.sats.is_empty() {
+            "—".to_string()
+        } else {
+            self.sats
+                .iter()
+                .map(|(s, n)| format!("{s}:{n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    /// Human-readable base position, or "unknown" if not seen yet.
+    fn pos_line(&self) -> String {
+        match self.pos {
+            Some((lat, lon, h)) => {
+                let ns = if lat >= 0.0 { 'N' } else { 'S' };
+                let ew = if lon >= 0.0 { 'E' } else { 'W' };
+                format!("{:.6}°{ns} {:.6}°{ew} {:.1}m", lat.abs(), lon.abs(), h)
+            }
+            None => "unknown".to_string(),
+        }
+    }
+
+    /// Comma-separated list of RTCM message types seen.
+    fn types_line(&self) -> String {
+        self.types
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 #[derive(Parser, Clone, Debug)]
@@ -88,9 +143,9 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     log_file: Option<String>,
 
-    /// Interval (seconds) between hardware/connection heartbeat log lines.
-    /// Default is hourly. Set 0 to disable.
-    #[arg(long, default_value_t = 3600)]
+    /// Interval (seconds) between GPS/hardware heartbeat log lines.
+    /// Default is once a minute. Set 0 to disable.
+    #[arg(long, default_value_t = 60)]
     heartbeat_secs: u64,
 
     /// Self-test mode: open the serial device, verify a valid RTCM 3 stream is
@@ -127,6 +182,7 @@ async fn run_serial_reader(
                 stats.serial_up.store(true, Ordering::Relaxed);
                 let mut buf = [0u8; 4096];
                 let mut got_data = false; // log the first bytes of each connection
+                let mut deframer = rtcm::Deframer::new();
                 loop {
                     match port.read(&mut buf).await {
                         Ok(0) => {
@@ -140,8 +196,9 @@ async fn run_serial_reader(
                             }
                             debug!("serial: {} bytes", n);
                             stats.serial_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                            // Drop on no-subscribers is fine.
+                            // Forward verbatim, and decode a copy to track GNSS state.
                             let _ = tx.send(buf[..n].to_vec());
+                            update_gnss(&stats, &mut deframer, &buf[..n]);
                         }
                         Err(e) => {
                             error!("Serial read error on {}: {} — will reopen", device, e);
@@ -159,9 +216,53 @@ async fn run_serial_reader(
     }
 }
 
+/// Decode RTCM frames from the stream and update the shared GNSS state. The
+/// first time a base position is decoded, log a one-time hardware summary.
+fn update_gnss(stats: &ServerStats, deframer: &mut rtcm::Deframer, data: &[u8]) {
+    let mut announce: Option<String> = None;
+    {
+        let mut g = stats.gnss.lock().unwrap();
+        for frame in deframer.push(data) {
+            if !frame.crc_ok {
+                continue;
+            }
+            let Some(msg) = frame.msg_type() else { continue };
+            g.types.insert(msg);
+            if let Some(sys) = rtcm::msm_system(msg) {
+                if let Some(count) = rtcm::msm_satellite_count(&frame.payload) {
+                    g.sats.insert(sys, count);
+                }
+            } else if matches!(msg, 1005 | 1006) {
+                if let Some(pos) = rtcm::station_position(&frame.payload) {
+                    g.pos = Some(pos);
+                }
+                g.station_id = rtcm::station_id(&frame.payload);
+            }
+        }
+        // Announce once we have a base position, after the whole batch is
+        // counted so the summary reflects every constellation seen so far.
+        if !g.announced && g.pos.is_some() {
+            g.announced = true;
+            let id = g
+                .station_id
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "?".into());
+            announce = Some(format!(
+                "Hardware: base station #{id} at {} | constellations: {} | messages: {}",
+                g.pos_line(),
+                g.sats_line(),
+                g.types_line()
+            ));
+        }
+    }
+    if let Some(msg) = announce {
+        info!("{msg}");
+    }
+}
+
 // =============================================================================
-// Heartbeat — periodically logs hardware connection status and throughput so
-// operators can confirm the link is alive even when no clients are connected.
+// Heartbeat — once a minute, logs a GPS/hardware one-liner: link status,
+// throughput, satellites per constellation, base position, and client count.
 // =============================================================================
 async fn run_heartbeat(stats: Arc<ServerStats>, period: Duration) -> ! {
     let mut interval = tokio::time::interval(period);
@@ -176,6 +277,11 @@ async fn run_heartbeat(stats: Arc<ServerStats>, period: Duration) -> ! {
         let secs = period.as_secs_f64();
         let rate = delta as f64 / secs;
 
+        let (sats, pos) = {
+            let g = stats.gnss.lock().unwrap();
+            (g.sats_line(), g.pos_line())
+        };
+
         if !stats.serial_up.load(Ordering::Relaxed) {
             warn!("heartbeat: serial link DOWN (port not open) — {clients} client(s) waiting");
         } else if delta == 0 {
@@ -185,8 +291,7 @@ async fn run_heartbeat(stats: Arc<ServerStats>, period: Duration) -> ! {
             );
         } else {
             info!(
-                "heartbeat: serial link UP — {delta} bytes in {secs:.0}s ({rate:.0} B/s), \
-                 {clients} client(s) connected"
+                "heartbeat: UP {rate:.0} B/s | sats {sats} | base {pos} | {clients} client(s)"
             );
         }
     }
@@ -194,178 +299,9 @@ async fn run_heartbeat(stats: Arc<ServerStats>, period: Duration) -> ! {
 
 // =============================================================================
 // RTCM 3 self-test — open the hardware, read the live stream, validate framing
-// and CRC, decode a few human-readable readings, and report pass/fail.
-//
-// RTCM 3 frame layout:
-//   byte 0      : 0xD3 preamble
-//   byte 1..2   : 6 reserved bits + 10-bit payload length (big-endian)
-//   byte 3..    : payload  (first 12 bits = message number)
-//   last 3 bytes: CRC-24Q over preamble+length+payload
+// and CRC (via the shared `rtcm` module), decode a few human-readable readings,
+// and report pass/fail.
 // =============================================================================
-
-/// CRC-24Q (RTCM 3 / Qualcomm), polynomial 0x1864CFB, init 0.
-fn crc24q(data: &[u8]) -> u32 {
-    const POLY: u32 = 0x0186_4CFB;
-    let mut crc: u32 = 0;
-    for &b in data {
-        crc ^= (b as u32) << 16;
-        for _ in 0..8 {
-            crc <<= 1;
-            if crc & 0x0100_0000 != 0 {
-                crc ^= POLY;
-            }
-        }
-    }
-    crc & 0x00FF_FFFF
-}
-
-/// Minimal big-endian bit reader over an RTCM payload.
-struct Bits<'a> {
-    d: &'a [u8],
-}
-impl Bits<'_> {
-    /// Unsigned big-endian field of `len` bits starting at bit `start`.
-    fn u(&self, start: usize, len: usize) -> u64 {
-        let mut v = 0u64;
-        for i in 0..len {
-            let bit = start + i;
-            v = (v << 1) | ((self.d[bit / 8] >> (7 - (bit % 8))) & 1) as u64;
-        }
-        v
-    }
-    /// Two's-complement signed field.
-    fn i(&self, start: usize, len: usize) -> i64 {
-        let v = self.u(start, len);
-        if v & (1 << (len - 1)) != 0 {
-            v as i64 - (1i64 << len)
-        } else {
-            v as i64
-        }
-    }
-}
-
-/// WGS84 ECEF (metres) → geodetic latitude/longitude (degrees) and height (m).
-fn ecef_to_geodetic(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
-    const A: f64 = 6_378_137.0;
-    const F: f64 = 1.0 / 298.257_223_563;
-    let e2 = F * (2.0 - F);
-    let lon = y.atan2(x);
-    let p = (x * x + y * y).sqrt();
-    let mut lat = z.atan2(p * (1.0 - e2));
-    let mut h = 0.0;
-    for _ in 0..6 {
-        let s = lat.sin();
-        let n = A / (1.0 - e2 * s * s).sqrt();
-        h = p / lat.cos() - n;
-        lat = z.atan2(p * (1.0 - e2 * n / (n + h)));
-    }
-    (lat.to_degrees(), lon.to_degrees(), h)
-}
-
-#[derive(Default)]
-struct TestStats {
-    total_bytes: usize,
-    frames_ok: usize,
-    crc_errors: usize,
-    msg_counts: BTreeMap<u16, usize>,
-}
-
-/// Decode one RTCM message into a human-readable line on stdout. Best-effort:
-/// only the common base-station messages are decoded in detail.
-fn print_reading(payload: &[u8]) {
-    if payload.len() < 2 {
-        return;
-    }
-    let b = Bits { d: payload };
-    let msg = ((payload[0] as u16) << 4) | ((payload[1] as u16) >> 4);
-    let nbits = payload.len() * 8;
-    match msg {
-        // Stationary antenna reference position → decode ECEF and convert to lat/lon.
-        1005 | 1006 if nbits >= 152 => {
-            let id = b.u(12, 12);
-            let x = b.i(34, 38) as f64 * 0.0001;
-            let y = b.i(74, 38) as f64 * 0.0001;
-            let z = b.i(114, 38) as f64 * 0.0001;
-            let (lat, lon, h) = ecef_to_geodetic(x, y, z);
-            let ns = if lat >= 0.0 { 'N' } else { 'S' };
-            let ew = if lon >= 0.0 { 'E' } else { 'W' };
-            println!("  [{msg}] base station #{id} antenna reference position:");
-            println!(
-                "        {:.7}°{ns}  {:.7}°{ew}  height {:.2} m",
-                lat.abs(),
-                lon.abs(),
-                h
-            );
-            println!("        ECEF  X={x:.3}  Y={y:.3}  Z={z:.3}  (metres)");
-        }
-        // MSM observation messages → satellite count comes from the 64-bit mask.
-        m @ (1071..=1077 | 1081..=1087 | 1091..=1097 | 1101..=1107 | 1111..=1117 | 1121..=1127)
-            if nbits >= 137 =>
-        {
-            let sys = match m / 10 {
-                107 => "GPS",
-                108 => "GLONASS",
-                109 => "Galileo",
-                110 => "SBAS",
-                111 => "QZSS",
-                112 => "BeiDou",
-                _ => "GNSS",
-            };
-            let nsat = b.u(73, 64).count_ones();
-            println!("  [{msg}] {sys} observations (MSM) — {nsat} satellites tracked");
-        }
-        1019 => println!("  [{msg}] GPS satellite ephemeris"),
-        1020 => println!("  [{msg}] GLONASS satellite ephemeris"),
-        1042 => println!("  [{msg}] BeiDou satellite ephemeris"),
-        1046 => println!("  [{msg}] Galileo satellite ephemeris"),
-        1230 => println!("  [{msg}] GLONASS code-phase biases"),
-        1007 | 1008 | 1033 => println!("  [{msg}] antenna / receiver descriptor"),
-        _ => println!("  [{msg}] RTCM message"),
-    }
-}
-
-/// Pull every complete, CRC-valid frame out of the accumulator, updating stats
-/// and printing a reading the first time each message type is seen. Bytes for a
-/// partial trailing frame are retained for the next call.
-fn consume_frames(acc: &mut Vec<u8>, stats: &mut TestStats) {
-    let mut i = 0;
-    while acc.len() >= i + 3 {
-        if acc[i] != 0xD3 {
-            i += 1; // not a preamble — slide forward to resync
-            continue;
-        }
-        let len = (((acc[i + 1] & 0x03) as usize) << 8) | acc[i + 2] as usize;
-        let frame_len = 3 + len + 3; // header + payload + CRC-24Q
-        if acc.len() < i + frame_len {
-            break; // rest of the frame hasn't arrived yet
-        }
-        let frame = &acc[i..i + frame_len];
-        let computed = crc24q(&frame[..3 + len]);
-        let received = ((frame[3 + len] as u32) << 16)
-            | ((frame[3 + len + 1] as u32) << 8)
-            | frame[3 + len + 2] as u32;
-        if computed == received {
-            stats.frames_ok += 1;
-            let payload = &frame[3..3 + len];
-            if len >= 2 {
-                let msg = ((payload[0] as u16) << 4) | ((payload[1] as u16) >> 4);
-                let count = stats.msg_counts.entry(msg).or_insert(0);
-                *count += 1;
-                if *count == 1 {
-                    print_reading(payload);
-                }
-            }
-            i += frame_len;
-        } else {
-            stats.crc_errors += 1;
-            i += 1; // false preamble — slide forward and try again
-        }
-    }
-    acc.drain(..i);
-}
-
-/// Open the device, read for `dur`, validate the stream, and report. Returns an
-/// error (non-zero exit) if no data or no valid RTCM 3 frames are seen.
 async fn run_self_test(device: &str, baud: u32, dur: Duration) -> Result<()> {
     println!("fm-ntrip self-test: opening {device} @ {baud} baud …");
     let mut port = tokio_serial::new(device, baud)
@@ -377,8 +313,11 @@ async fn run_self_test(device: &str, baud: u32, dur: Duration) -> Result<()> {
         dur.as_secs()
     );
 
-    let mut stats = TestStats::default();
-    let mut acc: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut deframer = rtcm::Deframer::new();
+    let mut total_bytes = 0usize;
+    let mut frames_ok = 0usize;
+    let mut crc_errors = 0usize;
+    let mut msg_counts: BTreeMap<u16, usize> = BTreeMap::new();
     let mut buf = [0u8; 4096];
     let deadline = tokio::time::Instant::now() + dur;
 
@@ -394,35 +333,50 @@ async fn run_self_test(device: &str, baud: u32, dur: Duration) -> Result<()> {
                 break;
             }
             Ok(Ok(n)) => {
-                stats.total_bytes += n;
-                acc.extend_from_slice(&buf[..n]);
-                consume_frames(&mut acc, &mut stats);
+                total_bytes += n;
+                for frame in deframer.push(&buf[..n]) {
+                    if !frame.crc_ok {
+                        crc_errors += 1;
+                        continue;
+                    }
+                    frames_ok += 1;
+                    if let Some(msg) = frame.msg_type() {
+                        let count = msg_counts.entry(msg).or_insert(0);
+                        *count += 1;
+                        if *count == 1 {
+                            // Print each message type's decoded reading once.
+                            for line in rtcm::describe_message(&frame.payload) {
+                                println!("  {line}");
+                            }
+                        }
+                    }
+                }
             }
             Ok(Err(e)) => return Err(anyhow::anyhow!("serial read error on {device}: {e}")),
         }
     }
 
     println!("\n── self-test report ───────────────────────────────");
-    println!("  bytes read      : {}", stats.total_bytes);
-    println!("  valid frames    : {}", stats.frames_ok);
-    println!("  CRC errors      : {}", stats.crc_errors);
-    if stats.msg_counts.is_empty() {
+    println!("  bytes read      : {total_bytes}");
+    println!("  valid frames    : {frames_ok}");
+    println!("  CRC errors      : {crc_errors}");
+    if msg_counts.is_empty() {
         println!("  message types   : none");
     } else {
         println!("  message types   :");
-        for (ty, cnt) in &stats.msg_counts {
+        for (ty, cnt) in &msg_counts {
             println!("        {ty:<5} ×{cnt}");
         }
     }
     println!("───────────────────────────────────────────────────");
 
-    if stats.total_bytes == 0 {
+    if total_bytes == 0 {
         anyhow::bail!(
             "no data received from {device} — is the receiver powered and enumerated? \
              Check `dmesg | grep ttyACM` and the cable."
         );
     }
-    if stats.frames_ok == 0 {
+    if frames_ok == 0 {
         anyhow::bail!(
             "data received but no valid RTCM 3 frames decoded — wrong device, or the \
              receiver is not configured to output RTCM 3 on this port."
@@ -766,120 +720,5 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn crc24q_check_vector() {
-        // Canonical CRC-24Q check value (RTKLIB / gpsd) for "123456789".
-        assert_eq!(crc24q(b"123456789"), 0x00CD_E703);
-    }
-
-    /// Big-endian bit writer, mirror of `Bits`, for building test frames.
-    struct BitWriter {
-        d: Vec<u8>,
-        bit: usize,
-    }
-    impl BitWriter {
-        fn new(bits: usize) -> Self {
-            Self {
-                d: vec![0u8; bits.div_ceil(8)],
-                bit: 0,
-            }
-        }
-        fn put(&mut self, val: u64, len: usize) {
-            for i in (0..len).rev() {
-                let b = ((val >> i) & 1) as u8;
-                let pos = self.bit;
-                self.d[pos / 8] |= b << (7 - (pos % 8));
-                self.bit += 1;
-            }
-        }
-    }
-
-    /// Wrap a payload in a full RTCM 3 frame (preamble + length + CRC-24Q).
-    fn frame(payload: &[u8]) -> Vec<u8> {
-        let mut f = vec![0xD3, ((payload.len() >> 8) & 0x03) as u8, (payload.len() & 0xFF) as u8];
-        f.extend_from_slice(payload);
-        let crc = crc24q(&f);
-        f.extend_from_slice(&[(crc >> 16) as u8, (crc >> 8) as u8, crc as u8]);
-        f
-    }
-
-    /// Build an RTCM 1005 payload encoding the given ECEF coordinates (metres).
-    fn build_1005(station_id: u64, x: f64, y: f64, z: f64) -> Vec<u8> {
-        let mut w = BitWriter::new(152);
-        w.put(1005, 12); // message number
-        w.put(station_id, 12); // DF003 reference station ID
-        w.put(0, 6); // DF021 ITRF year
-        w.put(0, 4); // GPS/GLO/GAL/ref-station indicators
-        w.put((x / 0.0001).round() as i64 as u64 & ((1 << 38) - 1), 38); // DF025 ECEF-X
-        w.put(0, 2); // oscillator + reserved
-        w.put((y / 0.0001).round() as i64 as u64 & ((1 << 38) - 1), 38); // DF026 ECEF-Y
-        w.put(0, 2); // quarter-cycle indicator
-        w.put((z / 0.0001).round() as i64 as u64 & ((1 << 38) - 1), 38); // DF027 ECEF-Z
-        w.d
-    }
-
-    #[test]
-    fn parses_1005_and_recovers_ecef() {
-        // ECEF for a point near 37.0°N, -122.0°E on the WGS84 ellipsoid.
-        let (x, y, z) = (-2_702_584.6, -4_325_039.454, 3_817_393.16);
-        let bytes = frame(&build_1005(42, x, y, z));
-
-        let mut acc = bytes.clone();
-        let mut stats = TestStats::default();
-        consume_frames(&mut acc, &mut stats);
-
-        assert_eq!(stats.frames_ok, 1, "one valid frame expected");
-        assert_eq!(stats.crc_errors, 0);
-        assert_eq!(stats.msg_counts.get(&1005), Some(&1));
-        assert!(acc.is_empty(), "complete frame fully consumed");
-
-        // Round-trip the ECEF → geodetic → sanity-check the latitude/longitude.
-        let (lat, lon, h) = ecef_to_geodetic(x, y, z);
-        assert!((lat - 37.0).abs() < 0.5, "lat ~37°, got {lat}");
-        assert!((lon + 122.0).abs() < 0.5, "lon ~-122°, got {lon}");
-        assert!(h.abs() < 100.0, "height near ellipsoid, got {h}");
-    }
-
-    #[test]
-    fn rejects_corrupt_crc_and_resyncs() {
-        let good = frame(&build_1005(1, -2_702_584.0, -4_325_039.0, 3_817_393.0));
-        let mut corrupt = good.clone();
-        let n = corrupt.len();
-        corrupt[n - 1] ^= 0xFF; // smash the CRC
-
-        // Garbage byte, then a corrupt frame, then a good frame.
-        let mut acc = vec![0x00];
-        acc.extend_from_slice(&corrupt);
-        acc.extend_from_slice(&good);
-
-        let mut stats = TestStats::default();
-        consume_frames(&mut acc, &mut stats);
-
-        assert_eq!(stats.frames_ok, 1, "only the intact frame should pass");
-        assert!(stats.crc_errors >= 1, "corrupt frame should register a CRC error");
-    }
-
-    #[test]
-    fn retains_partial_trailing_frame() {
-        let bytes = frame(&build_1005(7, -2_702_584.0, -4_325_039.0, 3_817_393.0));
-        let split = bytes.len() - 4; // cut mid-frame
-        let mut acc = bytes[..split].to_vec();
-        let mut stats = TestStats::default();
-
-        consume_frames(&mut acc, &mut stats);
-        assert_eq!(stats.frames_ok, 0, "incomplete frame not yet decoded");
-        assert_eq!(acc.len(), split, "partial bytes retained for next read");
-
-        acc.extend_from_slice(&bytes[split..]); // remainder arrives
-        consume_frames(&mut acc, &mut stats);
-        assert_eq!(stats.frames_ok, 1, "frame decoded once complete");
-        assert!(acc.is_empty());
     }
 }

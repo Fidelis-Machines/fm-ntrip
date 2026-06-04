@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 name = "fm-ntrip"
 path = "src/main.rs"
 
+[[bin]]
+name = "fm-ntrip-client"
+path = "src/client.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
 tokio-serial = "5"

@@ -91,7 +91,7 @@ ENABLE_NOW=0       ./scripts/install-service.sh   # install without starting
 
 The unit, env template, and logrotate rule live under [`systemd/`](systemd/) if
 you prefer to install by hand. The service redirects both streams to
-`/var/log/fm-ntrip.log` (startup, rover connect/disconnect, hourly heartbeats);
+`/var/log/fm-ntrip.log` (startup, rover connect/disconnect, GPS heartbeats);
 see [Logging](#logging). Tail it with `tail -f /var/log/fm-ntrip.log`. The file
 is appended across restarts and rotated weekly (or at 50 MB, 8 kept) by the
 installed `logrotate` rule.
@@ -126,6 +126,52 @@ environment variables.
 Point any NTRIP client at the host, port `2101`, mountpoint `RTCM3`, with the
 configured username and password. Fetching the root path (`GET /`) returns the
 NTRIP source table describing the available mountpoint.
+
+## Rover client (`fm-ntrip-client`)
+
+The crate also builds a companion NTRIP **rover client** that connects to a
+caster, authenticates against a mountpoint, and pulls the RTCM 3 correction
+stream — the same role an RTK rover plays. It shares the framing/decoding code
+with the server's self-test.
+
+```sh
+# Decode the stream to readable lines on stdout (status goes to stderr)
+fm-ntrip-client --host 192.168.1.10 --mountpoint RTCM3 \
+  --username base --password secret
+
+# Pipe the raw RTCM bytes somewhere (e.g. to a receiver or a file)
+fm-ntrip-client -H 192.168.1.10 -u base -p secret --raw > corrections.rtcm3
+
+# List the caster's mountpoints
+fm-ntrip-client -H 192.168.1.10 --sourcetable
+```
+
+Decoded output looks like:
+
+```text
+[1005] base station #0 antenna reference position:
+      XX.XXXXXXX°N  XXX.XXXXXXX°W  height XX.XX m
+      ECEF  X=-XXXXXXX.XXX  Y=-XXXXXXX.XXX  Z=XXXXXXX.XXX  (metres)
+[1077] GPS observations (MSM) — 9 satellites tracked
+[1087] GLONASS observations (MSM) — 6 satellites tracked
+```
+
+Credentials can come from `NTRIP_USER` / `NTRIP_PASS` instead of the flags.
+`--raw` writes the unmodified RTCM bytes to stdout (all diagnostics stay on
+stderr, so the pipe is clean); `--reconnect` retries with a 5 s backoff if the
+stream drops.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-H`, `--host` | `127.0.0.1` | Caster host |
+| `--port` | `2101` | Caster TCP port |
+| `-m`, `--mountpoint` | `RTCM3` | Mountpoint to subscribe to |
+| `-u`, `--username` | `user` (`NTRIP_USER`) | HTTP Basic auth username |
+| `-p`, `--password` | `pass` (`NTRIP_PASS`) | HTTP Basic auth password |
+| `--raw` | — | Emit raw RTCM bytes to stdout instead of decoded text |
+| `--sourcetable` | — | Print the caster's source table and exit |
+| `--reconnect` | — | Auto-reconnect (5 s backoff) on stream drop |
+| `--timeout` | `10` | Handshake connect/read timeout (seconds) |
 
 ### Hardware self-test
 
@@ -190,7 +236,7 @@ configured to output RTCM 3).
 | `--country` | `USA` | ISO 3-letter country code |
 | `--queue-size` | `1024` | Per-client broadcast queue capacity |
 | `--log-file` | — | Append logs to this file (in addition to stdout) |
-| `--heartbeat-secs` | `3600` | Interval between hardware status heartbeats (`0` disables) |
+| `--heartbeat-secs` | `60` | Interval between GPS/hardware heartbeats (`0` disables) |
 | `-t`, `--test` | — | Hardware self-test: verify the RTCM 3 stream and exit (no caster) |
 | `--test-secs` | `10` | Seconds the self-test reads from the device before reporting |
 | `-v`, `--verbose` | — | Increase log verbosity (`-v` debug, `-vv` trace) |
@@ -209,23 +255,29 @@ within whatever is emitted.
 
 Logged events include:
 
-- **Startup** — listen address, mountpoint, and serial device.
+- **Startup** — version banner, listen address, mountpoint, and serial device.
 - **Serial link** — port open/close and automatic reconnects.
+- **Hardware summary** — the server decodes the RTCM stream as it passes
+  through. The first time it sees the base position, it logs a one-time
+  hardware line: station ID, position, constellations, and message types.
 - **Rover connect/disconnect** — peer address, user-agent, and the running
   count of connected clients; on disconnect, the number of bytes streamed.
-- **Heartbeat** — every `--heartbeat-secs` (hourly by default), a line
-  reporting whether the serial link is up, how much data arrived in the
-  interval, and how many clients are connected. If the port is open but no data
-  is arriving (a stalled receiver), or the port is down, it logs a warning. This
-  gives you a periodic health signal even when no rovers are connected.
+- **GPS heartbeat** — every `--heartbeat-secs` (once a minute by default), a
+  one-liner with the serial link status, throughput, satellites per
+  constellation, the base position, and the client count. If the port is open
+  but no data is arriving (a stalled receiver), or the port is down, it logs a
+  warning instead — a periodic health signal even when no rovers are connected.
 
 ```text
+INFO Starting fm-ntrip v0.1.0
 INFO Listening on 0.0.0.0:2101 (mountpoint=/RTCM3 user=base)
 INFO Serial port /dev/ttyACM0 open
+INFO Receiving data from /dev/ttyACM0 (512 bytes in first read)
+INFO Hardware: base station #0 at XX.XXXXXX°N XXX.XXXXXX°W XX.Xm | constellations: GPS:9 GLONASS:6 Galileo:7 | messages: 1005,1077,1087,1097,1230
 INFO 10.0.0.5:55058 rover connected to /RTCM3 (ua=NTRIP testrover) — 1 client(s) now connected
-INFO heartbeat: serial link UP — 1843200 bytes in 3600s (512 B/s), 1 client(s) connected
+INFO heartbeat: UP 512 B/s | sats GPS:9 GLONASS:6 Galileo:7 | base XX.XXXXXX°N XXX.XXXXXX°W XX.Xm | 1 client(s)
 INFO 10.0.0.5:55058 rover disconnected (1843200 bytes sent) — 0 client(s) still connected
-WARN heartbeat: serial port OPEN but received NO data in last 3600s — receiver stalled? — 0 client(s)
+WARN heartbeat: serial port OPEN but received NO data in last 60s — receiver stalled? — 0 client(s)
 ```
 
 ### Logging to a file

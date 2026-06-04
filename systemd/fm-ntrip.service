@@ -32,7 +32,7 @@ ExecStart=/usr/local/bin/fm-ntrip \
     --baud 115200 \
     --listen 0.0.0.0:2101 \
     --mountpoint RTCM3 \
-    --heartbeat-secs 3600
+    --heartbeat-secs 60
 
 # --- Logging --------------------------------------------------------------
 # Append (don't truncate) so logs survive restarts. Use `logrotate` to cap size.
