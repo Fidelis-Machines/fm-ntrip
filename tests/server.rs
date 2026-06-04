@@ -146,6 +146,18 @@ fn get(path: &str, auth: Option<&str>) -> String {
     req
 }
 
+/// An NTRIP v2 request: HTTP/1.1 with the `Ntrip-Version: Ntrip/2.0` header.
+fn get_v2(path: &str, auth: Option<&str>) -> String {
+    let mut req = format!(
+        "GET /{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nNtrip-Version: Ntrip/2.0\r\nUser-Agent: test\r\n"
+    );
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: Basic {a}\r\n"));
+    }
+    req.push_str("\r\n");
+    req
+}
+
 #[test]
 fn serves_source_table_at_root() {
     let caster = Caster::start("/nonexistent/fm-ntrip-test-device");
@@ -209,6 +221,49 @@ fn good_credentials_upgrade_to_stream() {
     assert_eq!(status, "ICY 200 OK", "valid auth should upgrade to a stream");
 }
 
+// ── NTRIP v2 (HTTP/1.1 + chunked) ───────────────────────────────────────────
+
+#[test]
+fn v2_source_table_is_http_with_gnss_media_type() {
+    let caster = Caster::start("/nonexistent/fm-ntrip-test-device");
+    let resp = caster.request(&get_v2("", None));
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK"),
+        "v2 root should be a standard HTTP/1.1 200; got: {resp:?}"
+    );
+    assert!(resp.contains("Content-Type: gnss/sourcetable"), "v2 media type");
+    assert!(resp.contains("Ntrip-Version: Ntrip/2.0"), "echoes version");
+    assert!(resp.contains(&format!("STR;{MOUNT};")), "advertises mountpoint");
+    assert!(resp.contains("ENDSOURCETABLE"));
+}
+
+#[test]
+fn v2_bad_auth_is_http11_401() {
+    let caster = Caster::start("/nonexistent/fm-ntrip-test-device");
+    let wrong = base64::engine::general_purpose::STANDARD.encode("rover:WRONG");
+    let resp = caster.request(&get_v2(MOUNT, Some(&wrong)));
+    assert!(
+        resp.starts_with("HTTP/1.1 401"),
+        "v2 bad auth should be HTTP/1.1 401; got: {resp:?}"
+    );
+}
+
+#[test]
+fn v2_upgrade_announces_chunked_stream() {
+    let caster = Caster::start("/nonexistent/fm-ntrip-test-device");
+    let mut s = caster.connect();
+    s.write_all(get_v2(MOUNT, Some(&good_auth())).as_bytes()).unwrap();
+    let status = read_status_line(&mut s);
+    assert_eq!(status, "HTTP/1.1 200 OK", "v2 upgrade is a real HTTP response");
+    // The remaining headers should advertise the gnss/data chunked stream.
+    let headers = read_to_end_or_timeout(&mut s);
+    assert!(headers.contains("Content-Type: gnss/data"), "v2 data media type");
+    assert!(
+        headers.contains("Transfer-Encoding: chunked"),
+        "v2 stream is chunked; got headers: {headers:?}"
+    );
+}
+
 // ── Fan-out: one serial source → many rovers ────────────────────────────────
 
 #[test]
@@ -245,6 +300,107 @@ fn broadcasts_serial_bytes_to_all_clients() {
     // Both rovers must receive the exact bytes the caster read from serial.
     assert_eq!(read_exact_n(&mut a, marker.len()), marker, "rover A fan-out");
     assert_eq!(read_exact_n(&mut b, marker.len()), marker, "rover B fan-out");
+}
+
+#[test]
+fn v2_wraps_serial_bytes_in_http_chunks() {
+    use nix::fcntl::OFlag;
+    use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
+
+    let mut master = posix_openpt(OFlag::O_RDWR).expect("open pty master");
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let slave_path = ptsname_r(&master).expect("slave pty path");
+
+    let caster = Caster::start(&slave_path);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A v2 rover completes the chunked upgrade.
+    let mut rover = caster.connect();
+    rover
+        .write_all(get_v2(MOUNT, Some(&good_auth())).as_bytes())
+        .unwrap();
+    assert_eq!(read_status_line(&mut rover), "HTTP/1.1 200 OK");
+    // Drain the response headers up to the blank line.
+    loop {
+        let line = read_status_line(&mut rover);
+        if line.is_empty() {
+            break;
+        }
+    }
+
+    // Push 16 bytes through the serial device; expect one HTTP chunk back.
+    let marker: Vec<u8> = (b'@'..=b'O').collect();
+    master.write_all(&marker).unwrap();
+    master.flush().ok();
+
+    // Chunk = "10\r\n" (16 in hex) + the 16 payload bytes + "\r\n".
+    let mut expected = b"10\r\n".to_vec();
+    expected.extend_from_slice(&marker);
+    expected.extend_from_slice(b"\r\n");
+    assert_eq!(read_exact_n(&mut rover, expected.len()), expected, "chunk framing");
+}
+
+#[test]
+fn v2_client_dechunks_round_trip() {
+    use nix::fcntl::OFlag;
+    use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
+    use std::sync::mpsc;
+
+    let mut master = posix_openpt(OFlag::O_RDWR).expect("open pty master");
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let slave_path = ptsname_r(&master).expect("slave pty path");
+
+    let caster = Caster::start(&slave_path);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Spawn the real rover client in v2 + raw mode; it should dechunk the
+    // stream and emit the original bytes on stdout.
+    let mut client = Command::new(env!("CARGO_BIN_EXE_fm-ntrip-client"))
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &caster.port.to_string(),
+            "--mountpoint",
+            MOUNT,
+            "--username",
+            USER,
+            "--password",
+            PASS,
+            "--ntrip2",
+            "--raw",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fm-ntrip-client");
+
+    // Let the client connect and subscribe before pushing serial data.
+    std::thread::sleep(Duration::from_millis(700));
+    let marker: Vec<u8> = (b'@'..=b'O').collect();
+    master.write_all(&marker).unwrap();
+    master.flush().ok();
+
+    // Read the dechunked bytes from the client's stdout, off-thread so a stall
+    // can't hang the test.
+    let mut out = client.stdout.take().unwrap();
+    let want = marker.len();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; want];
+        let r = out.read_exact(&mut buf).map(|_| buf);
+        let _ = tx.send(r);
+    });
+
+    let got = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("client produced no output in time")
+        .expect("read client stdout");
+    let _ = client.kill();
+    let _ = client.wait();
+    assert_eq!(got, marker, "v2 client should reproduce the original bytes");
 }
 
 /// Read exactly `n` bytes (honouring the socket read timeout) and return them.

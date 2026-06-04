@@ -6,7 +6,6 @@
 // writes the raw RTCM bytes to stdout (for piping into a receiver or file).
 // All status/diagnostics go to stderr, so stdout stays clean for piping.
 
-use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -43,6 +42,11 @@ struct Cli {
     /// Password for HTTP Basic auth.
     #[arg(short, long, default_value = "pass", env = "NTRIP_PASS")]
     password: String,
+
+    /// Use NTRIP v2 (HTTP/1.1 request + chunked transfer encoding) instead of
+    /// the legacy v1 (ICY) protocol.
+    #[arg(long = "ntrip2")]
+    ntrip2: bool,
 
     /// Write raw RTCM bytes to stdout (for piping) instead of decoded text.
     #[arg(long)]
@@ -108,14 +112,29 @@ async fn run(cli: &Cli, addr: &str) -> Result<()> {
     };
     let auth = base64::engine::general_purpose::STANDARD
         .encode(format!("{}:{}", cli.username, cli.password));
-    let request = format!(
-        "GET /{path} HTTP/1.0\r\n\
-         User-Agent: NTRIP fm-ntrip-client/{}\r\n\
-         Authorization: Basic {auth}\r\n\
-         Ntrip-Version: Ntrip/1.0\r\n\
-         \r\n",
-        env!("CARGO_PKG_VERSION"),
-    );
+    let ver = env!("CARGO_PKG_VERSION");
+    // v2 uses HTTP/1.1 (with a Host header and chunked-aware handling); v1 uses
+    // the legacy HTTP/1.0 + ICY exchange.
+    let request = if cli.ntrip2 {
+        format!(
+            "GET /{path} HTTP/1.1\r\n\
+             Host: {}:{}\r\n\
+             Ntrip-Version: Ntrip/2.0\r\n\
+             User-Agent: NTRIP fm-ntrip-client/{ver}\r\n\
+             Authorization: Basic {auth}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            cli.host, cli.port,
+        )
+    } else {
+        format!(
+            "GET /{path} HTTP/1.0\r\n\
+             User-Agent: NTRIP fm-ntrip-client/{ver}\r\n\
+             Authorization: Basic {auth}\r\n\
+             Ntrip-Version: Ntrip/1.0\r\n\
+             \r\n",
+        )
+    };
     write_half
         .write_all(request.as_bytes())
         .await
@@ -159,7 +178,8 @@ async fn run(cli: &Cli, addr: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Stream upgrade. Our caster replies "ICY 200 OK"; tolerate "HTTP/1.x 200".
+    // Stream upgrade. v1 casters reply "ICY 200 OK"; v2 casters reply
+    // "HTTP/1.1 200 OK". Treat any 2xx as success and refuse explicit errors.
     if status.starts_with("ICY 200") || status.contains(" 200 ") {
         eprintln!("connected — streaming /{} (status: {status})", cli.mountpoint);
     } else if status.starts_with("HTTP") || status.contains("401") || status.contains("404") {
@@ -168,11 +188,63 @@ async fn run(cli: &Cli, addr: &str) -> Result<()> {
         bail!("unexpected caster response: {status:?}");
     }
 
-    stream_corrections(cli, &mut reader).await
+    // A v2 response carries HTTP headers before the body; consume them and note
+    // whether the stream is chunked. v1 (ICY) sends the raw stream immediately.
+    let mut chunked = false;
+    if cli.ntrip2 {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.context("read headers")?;
+            if n == 0 {
+                break;
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                break; // end of headers
+            }
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+                chunked = true;
+            }
+        }
+    }
+
+    if chunked {
+        stream_corrections_chunked(cli, &mut reader).await
+    } else {
+        stream_corrections(cli, &mut reader).await
+    }
 }
 
-/// Read the RTCM stream until the caster closes it; decode to stdout (or pass
-/// raw bytes through with --raw). Logs a per-message-type summary to stderr.
+/// Decode (or, with --raw, pass through) a slice of RTCM bytes already lifted out
+/// of the transport. Shared by the raw (v1) and chunked (v2) stream readers.
+fn process_bytes<W: std::io::Write>(
+    cli: &Cli,
+    deframer: &mut Deframer,
+    frames: &mut u64,
+    data: &[u8],
+    raw_out: &mut W,
+) -> Result<()> {
+    if cli.raw {
+        raw_out.write_all(data).context("write stdout")?;
+        raw_out.flush().ok();
+        return Ok(());
+    }
+    for frame in deframer.push(data) {
+        if !frame.crc_ok {
+            eprintln!("(dropped frame with bad CRC)");
+            continue;
+        }
+        *frames += 1;
+        for line in rtcm::describe_message(&frame.payload) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// Read a raw (NTRIP v1) RTCM stream until the caster closes it; decode to
+/// stdout (or pass raw bytes through with --raw).
 async fn stream_corrections<R>(cli: &Cli, reader: &mut R) -> Result<()>
 where
     R: AsyncReadExt + Unpin,
@@ -191,22 +263,49 @@ where
             return Ok(());
         }
         total += n as u64;
+        process_bytes(cli, &mut deframer, &mut frames, &buf[..n], &mut raw_out)?;
+    }
+}
 
-        if cli.raw {
-            raw_out.write_all(&buf[..n]).context("write stdout")?;
-            raw_out.flush().ok();
-            continue;
+/// Read a chunked (NTRIP v2 / HTTP/1.1) RTCM stream: each chunk is
+/// `<hex-len>\r\n<data>\r\n`, ending with a `0\r\n` chunk. The chunk framing is
+/// stripped before the bytes are decoded.
+async fn stream_corrections_chunked<R>(cli: &Cli, reader: &mut R) -> Result<()>
+where
+    R: AsyncBufReadExt + AsyncReadExt + Unpin,
+{
+    let mut deframer = Deframer::new();
+    let mut total: u64 = 0;
+    let mut frames: u64 = 0;
+    let stdout = std::io::stdout();
+    let mut raw_out = stdout.lock();
+
+    loop {
+        // Chunk-size line (hex, optional ";extensions" we ignore).
+        let mut size_line = String::new();
+        let n = reader.read_line(&mut size_line).await.context("read chunk size")?;
+        if n == 0 {
+            eprintln!("caster closed the stream ({total} bytes, {frames} frames)");
+            return Ok(());
+        }
+        let hex = size_line.trim().split(';').next().unwrap_or("").trim();
+        if hex.is_empty() {
+            continue; // tolerate stray blank lines between chunks
+        }
+        let size = usize::from_str_radix(hex, 16)
+            .with_context(|| format!("parse chunk size {hex:?}"))?;
+        if size == 0 {
+            eprintln!("caster ended the stream ({total} bytes, {frames} frames)");
+            return Ok(());
         }
 
-        for frame in deframer.push(&buf[..n]) {
-            if !frame.crc_ok {
-                eprintln!("(dropped frame with bad CRC)");
-                continue;
-            }
-            frames += 1;
-            for line in rtcm::describe_message(&frame.payload) {
-                println!("{line}");
-            }
-        }
+        let mut chunk = vec![0u8; size];
+        reader.read_exact(&mut chunk).await.context("read chunk body")?;
+        total += size as u64;
+        process_bytes(cli, &mut deframer, &mut frames, &chunk, &mut raw_out)?;
+
+        // Each chunk is followed by a CRLF terminator.
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf).await.context("read chunk trailer")?;
     }
 }

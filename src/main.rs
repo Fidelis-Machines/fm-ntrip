@@ -429,6 +429,7 @@ async fn handle_client(
 
         let mut auth_b64: Option<String> = None;
         let mut user_agent: Option<String> = None;
+        let mut ntrip_version: Option<String> = None;
         loop {
             let mut line = String::new();
             let n = reader.read_line(&mut line).await?;
@@ -445,14 +446,22 @@ async fn handle_client(
                 auth_b64 = Some(line[line.len() - rest.len()..].trim().to_string());
             } else if let Some(rest) = lower.strip_prefix("user-agent:") {
                 user_agent = Some(line[line.len() - rest.len()..].trim().to_string());
+            } else if let Some(rest) = lower.strip_prefix("ntrip-version:") {
+                ntrip_version = Some(line[line.len() - rest.len()..].trim().to_string());
             }
         }
-        anyhow::Ok((request_line, auth_b64, user_agent))
+        anyhow::Ok((request_line, auth_b64, user_agent, ntrip_version))
     })
     .await
     .context("client request read timeout")??;
 
-    let (request_line, auth_b64, user_agent) = request;
+    let (request_line, auth_b64, user_agent, ntrip_version) = request;
+    // NTRIP v2 clients announce themselves with `Ntrip-Version: Ntrip/2.0`. They
+    // expect proper HTTP/1.1 responses and a chunked stream; v1 clients get the
+    // legacy `ICY 200 OK` + raw byte stream. We auto-detect per request.
+    let v2 = ntrip_version
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("Ntrip/2.0"));
     debug!(
         "{} request={:?} ua={:?}",
         peer,
@@ -460,11 +469,14 @@ async fn handle_client(
         user_agent.as_deref().unwrap_or("-")
     );
 
+    // HTTP version used in our status lines: v2 mandates HTTP/1.1, v1 uses 1.0.
+    let http = if v2 { "HTTP/1.1" } else { "HTTP/1.0" };
+
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 || parts[0] != "GET" {
         debug!("{} malformed request {:?} — 400", peer, request_line);
         let _ = write_half
-            .write_all(b"HTTP/1.0 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .write_all(format!("{http} 400 Bad Request\r\nConnection: close\r\n\r\n").as_bytes())
             .await;
         return Ok(());
     }
@@ -473,18 +485,33 @@ async fn handle_client(
     // Root → source table.
     if path.is_empty() {
         let body = build_sourcetable(&cli);
-        let hdr = format!(
-            "SOURCETABLE 200 OK\r\n\
-             Server: fm-ntrip/{}\r\n\
-             Content-Type: text/plain\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n",
-            env!("CARGO_PKG_VERSION"),
-            body.len()
-        );
+        // v2 returns a standard HTTP/1.1 200 with the NTRIP source-table media
+        // type; v1 uses the legacy `SOURCETABLE 200 OK` status line.
+        let hdr = if v2 {
+            format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Ntrip-Version: Ntrip/2.0\r\n\
+                 Server: NTRIP fm-ntrip/{}\r\n\
+                 Content-Type: gnss/sourcetable\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                env!("CARGO_PKG_VERSION"),
+                body.len()
+            )
+        } else {
+            format!(
+                "SOURCETABLE 200 OK\r\n\
+                 Server: fm-ntrip/{}\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                env!("CARGO_PKG_VERSION"),
+                body.len()
+            )
+        };
         write_half.write_all(hdr.as_bytes()).await?;
         write_half.write_all(body.as_bytes()).await?;
-        info!("{} fetched source table", peer);
+        info!("{} fetched source table (ntrip{})", peer, if v2 { "2" } else { "1" });
         return Ok(());
     }
 
@@ -495,7 +522,7 @@ async fn handle_client(
             peer, path, cli.mountpoint
         );
         let _ = write_half
-            .write_all(b"HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n")
+            .write_all(format!("{http} 404 Not Found\r\nConnection: close\r\n\r\n").as_bytes())
             .await;
         return Ok(());
     }
@@ -512,36 +539,67 @@ async fn handle_client(
         );
         let _ = write_half
             .write_all(
-                b"HTTP/1.0 401 Unauthorized\r\n\
-                  WWW-Authenticate: Basic realm=\"NTRIP\"\r\n\
-                  Connection: close\r\n\r\n",
+                format!(
+                    "{http} 401 Unauthorized\r\n\
+                     WWW-Authenticate: Basic realm=\"NTRIP\"\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await;
         return Ok(());
     }
 
-    // Upgrade: NTRIP v1 response. Most clients (str2str, NTRIP Client, u-center)
-    // accept this; pure HTTP/1.1 NTRIP v2 isn't needed for typical use.
-    write_half.write_all(b"ICY 200 OK\r\n").await?;
+    // Upgrade. v2 clients get a standard HTTP/1.1 200 with chunked transfer
+    // encoding; v1 clients get the legacy `ICY 200 OK` and a raw byte stream.
+    if v2 {
+        write_half
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Ntrip-Version: Ntrip/2.0\r\n\
+                     Server: NTRIP fm-ntrip/{}\r\n\
+                     Content-Type: gnss/data\r\n\
+                     Cache-Control: no-store, no-cache, max-age=0\r\n\
+                     Connection: close\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n",
+                    env!("CARGO_PKG_VERSION")
+                )
+                .as_bytes(),
+            )
+            .await?;
+    } else {
+        write_half.write_all(b"ICY 200 OK\r\n").await?;
+    }
     let n_clients = stats.clients.fetch_add(1, Ordering::Relaxed) + 1;
     info!(
-        "{} rover connected to /{} (ua={}) — {} client(s) now connected",
+        "{} rover connected to /{} (ntrip{}, ua={}) — {} client(s) now connected",
         peer,
         cli.mountpoint,
+        if v2 { "2" } else { "1" },
         user_agent.as_deref().unwrap_or("-"),
         n_clients
     );
 
-    // Pump RTCM bytes to client until either side gives up.
+    // Pump RTCM bytes to client until either side gives up. Under NTRIP v2 each
+    // broadcast message is wrapped as one HTTP chunk (`<hex-len>\r\n<data>\r\n`).
     let mut bytes_sent: u64 = 0;
     loop {
         match rx.recv().await {
             Ok(bytes) => {
-                if let Err(e) = write_half.write_all(&bytes).await {
+                let frame = if v2 {
+                    let mut f = format!("{:X}\r\n", bytes.len()).into_bytes();
+                    f.extend_from_slice(&bytes);
+                    f.extend_from_slice(b"\r\n");
+                    f
+                } else {
+                    bytes
+                };
+                if let Err(e) = write_half.write_all(&frame).await {
                     debug!("{} write error: {} — disconnecting", peer, e);
                     break;
                 }
-                bytes_sent += bytes.len() as u64;
+                bytes_sent += frame.len() as u64;
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("{} lagging, dropped {} messages", peer, n);
@@ -551,6 +609,11 @@ async fn handle_client(
                 break;
             }
         }
+    }
+
+    // Best-effort terminating chunk so a v2 client sees a clean end of stream.
+    if v2 {
+        let _ = write_half.write_all(b"0\r\n\r\n").await;
     }
 
     let n_clients = stats.clients.fetch_sub(1, Ordering::Relaxed) - 1;

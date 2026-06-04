@@ -44,7 +44,7 @@ behind are dropped from the queue rather than stalling the stream.
                          │ └──────────┘  └────────────┘ └────────┘ │    └──────────────────┘
                          │                          TCP :2101       │
                          │   GET /          → SOURCETABLE           │  HTTP Basic auth
-                         │   GET /RTCM3     → ICY 200 OK + stream   │  NTRIP v1 (ICY)
+                         │   GET /RTCM3     → ICY / HTTP + stream   │  NTRIP v1 + v2
                          └──────────────────────────────────────────┘
 
    The serial reader forwards every byte to the broadcast channel (fan-out to
@@ -314,11 +314,27 @@ stderr to `/var/log/fm-ntrip.log` at the service level (`StandardOutput=` /
 service manager handles file creation. Either way, the file grows unbounded —
 add a `logrotate` rule to cap its size.
 
-## Notes
+## NTRIP v1 and v2
 
-- Clients are upgraded with the NTRIP v1 `ICY 200 OK` response, which `str2str`,
-  u-center, and most NTRIP clients accept. Pure HTTP/1.1 NTRIP v2 is not
-  implemented.
+The caster speaks both protocol versions and picks per request — no
+configuration needed:
+
+- **NTRIP v1** (the default for most clients): the request is answered with the
+  legacy `ICY 200 OK` status line followed by the raw RTCM byte stream. This is
+  what `str2str`, u-center, and most NTRIP clients use.
+- **NTRIP v2**: a client that sends `Ntrip-Version: Ntrip/2.0` gets a standard
+  `HTTP/1.1 200 OK` response with `Content-Type: gnss/data` and the stream sent
+  using **chunked transfer encoding**. The source table (`GET /`) is likewise
+  returned as an HTTP/1.1 response with `Content-Type: gnss/sourcetable`, and
+  error responses use HTTP/1.1 status lines.
+
+The bundled rover client defaults to v1; pass `--ntrip2` to use v2 (it sends the
+HTTP/1.1 request and transparently de-chunks the stream):
+
+```sh
+fm-ntrip-client --host caster.example --mountpoint RTCM3 \
+    --username user --password pass --ntrip2
+```
 
 ## License
 
