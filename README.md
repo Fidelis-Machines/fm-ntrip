@@ -1,13 +1,21 @@
 # fm-ntrip
 
-A lightweight **NTRIP server + caster** in a single binary. It reads an RTCM 3.x
-correction stream from a USB serial GNSS receiver and rebroadcasts it to any
-number of NTRIP clients over TCP.
+A lightweight **NTRIP server + caster** that reads an RTCM 3.x correction stream
+from a USB serial GNSS receiver and rebroadcasts it to any number of NTRIP
+clients over TCP. The crate also ships a companion **rover client** that pulls
+and decodes corrections from a caster.
 
 It is **designed to work with the [ArduSimple simpleRTK2B](https://www.ardusimple.com/)
 board** (u-blox **ZED-F9P**) configured as an RTK base station. The board's USB
 CDC interface appears as `/dev/ttyACM0` on Linux, which is the default device.
 It also works with any other receiver that emits raw RTCM 3 over a serial port.
+
+Two binaries are built from this crate:
+
+| Binary | Role |
+|--------|------|
+| `fm-ntrip` | The server/caster — reads the base receiver and serves corrections (also runs the hardware [self-test](#hardware-self-test)). |
+| `fm-ntrip-client` | The [rover client](#rover-client-fm-ntrip-client) — connects to a caster and pulls/decodes the RTCM stream. |
 
 ## How it works
 
@@ -19,25 +27,29 @@ without re-reading the device. The serial reader auto-reconnects on EOF or error
 behind are dropped from the queue rather than stalling the stream.
 
 ```
-                          fm-ntrip process
-   ┌───────────────┐    ┌──────────────────────────────────────┐    ┌──────────────┐
-   │  simpleRTK2B   │    │                                        │    │ NTRIP client │
-   │  (ZED-F9P)     │    │   ┌────────────────┐                   │ ┌─▶│ (RTK rover)  │
-   │  base station  │    │   │ serial reader  │                   │ │  └──────────────┘
+                          fm-ntrip process (server)
+   ┌───────────────┐    ┌──────────────────────────────────────┐    ┌──────────────────┐
+   │  simpleRTK2B   │    │                                        │    │ NTRIP rover      │
+   │  (ZED-F9P)     │    │   ┌────────────────┐                   │ ┌─▶│ (fm-ntrip-client)│
+   │  base station  │    │   │ serial reader  │                   │ │  └──────────────────┘
    │                │RTCM│   │  /dev/ttyACM0  │                   │ │
-   │  ┌──────────┐  │ 3.x│   │  auto-reconnect│                   │ │  ┌──────────────┐
-   │  │ GNSS RX  │──┼────┼──▶│                │                   │ ├─▶│ NTRIP client │
-   │  └──────────┘  │ USB│   └───────┬────────┘                   │ │  │ (str2str)    │
-   └───────────────┘    │           │ Vec<u8>                     │ │  └──────────────┘
-                         │           ▼                             │ │
-                         │   ┌────────────────┐    ┌────────────┐ │ │  ┌──────────────┐
-                         │   │   broadcast    │───▶│ per-client │─┼─┘  │ NTRIP client │
-                         │   │    channel     │    │  TCP tasks │─┼───▶│ (u-center)   │
-                         │   └────────────────┘    └────────────┘ │    └──────────────┘
-                         │                          TCP :2101      │
-                         │   GET /          → SOURCETABLE          │  HTTP Basic auth
-                         │   GET /RTCM3     → ICY 200 OK + stream  │  NTRIP v1 (ICY)
+   │  ┌──────────┐  │ 3.x│   │  auto-reconnect│                   │ │  ┌──────────────────┐
+   │  │ GNSS RX  │──┼────┼──▶│                │                   │ ├─▶│ NTRIP client      │
+   │  └──────────┘  │ USB│   └──┬──────────┬──┘                   │ │  │ (str2str)         │
+   └───────────────┘    │      │ Vec<u8>  │ decode tap           │ │  └──────────────────┘
+                         │      ▼          ▼                       │ │
+                         │ ┌──────────┐  ┌────────────┐ ┌────────┐ │ │  ┌──────────────────┐
+                         │ │broadcast │  │ GNSS state │ │per-clnt│─┼─┘  │ NTRIP client      │
+                         │ │ channel  │─▶│ +heartbeat │ │TCP task│─┼───▶│ (u-center)        │
+                         │ └──────────┘  └────────────┘ └────────┘ │    └──────────────────┘
+                         │                          TCP :2101       │
+                         │   GET /          → SOURCETABLE           │  HTTP Basic auth
+                         │   GET /RTCM3     → ICY 200 OK + stream   │  NTRIP v1 (ICY)
                          └──────────────────────────────────────────┘
+
+   The serial reader forwards every byte to the broadcast channel (fan-out to
+   clients) and also taps a copy through the RTCM decoder to track GNSS state
+   (base position, satellites per constellation) for the once-a-minute heartbeat.
 ```
 
 ## Build
@@ -46,7 +58,9 @@ behind are dropped from the queue rather than stalling the stream.
 cargo build --release
 ```
 
-The binary is produced at `target/release/fm-ntrip`.
+This produces both binaries: `target/release/fm-ntrip` (server) and
+`target/release/fm-ntrip-client` (rover client). To build just one, add
+`--bin fm-ntrip` or `--bin fm-ntrip-client`.
 
 ## Raspberry Pi deployment
 
