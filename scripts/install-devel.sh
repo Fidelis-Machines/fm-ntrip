@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# install-rpi.sh — Install Rust and build fm-ntrip on a Raspberry Pi.
+# install-devel.sh — Install Rust and build fm-ntrip on a Raspberry Pi.
 #
 # Installs the Rust toolchain via rustup, the system build prerequisites,
 # grants the current user serial-port access, and builds the release binary.
 #
-# Usage: ./scripts/install-rpi.sh [REPO_DIR]
+# Usage: ./scripts/install-devel.sh [REPO_DIR]
 #
 #   REPO_DIR  Path to the fm-ntrip checkout (the dir containing Cargo.toml).
 #             May also be given via the FM_NTRIP_DIR environment variable.

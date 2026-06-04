@@ -1,0 +1,53 @@
+[Unit]
+Description=fm-ntrip — NTRIP server/caster (simpleRTK2B RTCM → NTRIP clients)
+Documentation=https://github.com/shieldwolf/fm-ntrip
+# Start after the network is up; the serial reader retries on its own if the
+# receiver isn't enumerated yet, so we don't gate on the device here.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Identity -------------------------------------------------------------
+# Run as an unprivileged user. Change this to the account that owns the
+# install, and make sure that account can open the serial device — the
+# SupplementaryGroups=dialout line below grants access without needing root.
+User=aslanrtk
+SupplementaryGroups=dialout
+
+# --- Credentials ----------------------------------------------------------
+# NTRIP_USER / NTRIP_PASS are read from this file so they stay out of the unit
+# (and out of `ps`). See fm-ntrip.env.example. Mark it 0600.
+EnvironmentFile=/etc/fm-ntrip/fm-ntrip.env
+
+# --- Command --------------------------------------------------------------
+# Logs go to stdout, which systemd captures in the journal (journalctl).
+# The hourly heartbeat and connect/disconnect lines land there automatically.
+ExecStart=/usr/local/bin/fm-ntrip \
+    --device /dev/ttyACM0 \
+    --baud 115200 \
+    --listen 0.0.0.0:2101 \
+    --mountpoint RTCM3 \
+    --heartbeat-secs 3600
+
+# --- Restart policy -------------------------------------------------------
+# The process is long-lived and reconnects to the receiver internally; restart
+# only if it actually exits/crashes.
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening ------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

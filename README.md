@@ -48,6 +48,57 @@ cargo build --release
 
 The binary is produced at `target/release/fm-ntrip`.
 
+## Raspberry Pi deployment
+
+The intended deployment is a Raspberry Pi with the simpleRTK2B attached over
+USB. Helper scripts under [`scripts/`](scripts/) automate the setup; each
+auto-detects the repo location and can be run from anywhere.
+
+| Script | Purpose |
+|--------|---------|
+| [`scripts/install-devel.sh`](scripts/install-devel.sh) | Install Rust + build prerequisites, grant serial (`dialout`) access, and build the release binary. |
+| [`scripts/install-service.sh`](scripts/install-service.sh) | Install the binary, credentials file, and systemd unit, then enable + start the service. |
+| [`scripts/uninstall-service.sh`](scripts/uninstall-service.sh) | Stop, disable, and remove the service and binary (`--purge` also removes credentials). |
+
+Typical first-time setup on the Pi:
+
+```sh
+cd ~/fm-trip
+./scripts/install-devel.sh      # install Rust + toolchain, build the binary
+./scripts/install-service.sh    # install + start the systemd service
+journalctl -u fm-ntrip -f       # watch the logs
+```
+
+`install-service.sh` installs:
+
+- the binary to `/usr/local/bin/fm-ntrip`,
+- a credentials file at `/etc/fm-ntrip/fm-ntrip.env` (mode `0600`; an existing
+  one is never overwritten),
+- the unit at `/etc/systemd/system/fm-ntrip.service`, with `User=` set to the
+  invoking account.
+
+Useful overrides:
+
+```sh
+SERVICE_USER=ntrip ./scripts/install-service.sh   # run the service as another user
+ENABLE_NOW=0       ./scripts/install-service.sh   # install without starting
+```
+
+> **Set a password before exposing the caster.** The credentials file ships
+> with `NTRIP_PASS=change-me`. Edit `/etc/fm-ntrip/fm-ntrip.env` and run
+> `sudo systemctl restart fm-ntrip`.
+
+The unit and its template live under [`systemd/`](systemd/) if you prefer to
+install by hand. Logs (startup, rover connect/disconnect, hourly heartbeats) go
+to the journal — see [Logging](#logging).
+
+To remove everything:
+
+```sh
+./scripts/uninstall-service.sh           # keep credentials
+./scripts/uninstall-service.sh --purge   # remove credentials too
+```
+
 ## Usage
 
 ```sh
